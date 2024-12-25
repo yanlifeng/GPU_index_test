@@ -287,6 +287,10 @@ std::vector<uint64_t> readFileToVector(const std::string& filename) {
     infile.close();
     return data;
 }
+
+
+//#define use_managed
+
 int main(int argc, char** argv) {
     if (argc != 2) {
         std::cerr << "Usage: " << argv[0] << " <index_file_path>" << std::endl;
@@ -307,19 +311,19 @@ int main(int argc, char** argv) {
     printf("size %d, data[0] %lu\n", num_queries, queries[0]);
     double t0;
 
-    t0 = GetTime();
-    // Allocate d_positions and d_queries using cudaMallocManaged
     size_t* d_positions;
     randstrobe_hash_t* d_queries;
-    cudaMallocManaged(&d_positions, num_queries * sizeof(size_t));
-    cudaMallocManaged(&d_queries, num_queries * sizeof(randstrobe_hash_t));
-
-    // Copy queries data to d_queries
-    std::copy(queries.begin(), queries.end(), d_queries);
-    std::cout << "pre malloc and copy execution time: " << GetTime() - t0 << " seconds" << std::endl;
-
     RefRandstrobe* d_randstrobes;
     bucket_index_t* d_randstrobe_start_indices;
+
+    std::vector<size_t> positions(num_queries);
+
+#ifdef use_managed
+    t0 = GetTime();
+    cudaMallocManaged(&d_positions, num_queries * sizeof(size_t));
+    cudaMallocManaged(&d_queries, num_queries * sizeof(randstrobe_hash_t));
+    std::copy(queries.begin(), queries.end(), d_queries);
+    std::cout << "pre malloc and copy execution time: " << GetTime() - t0 << " seconds" << std::endl;
 
     t0 = GetTime();
     cudaMalloc(&d_randstrobes, index.randstrobes.size() * sizeof(RefRandstrobe));
@@ -330,6 +334,24 @@ int main(int argc, char** argv) {
     cudaMemcpy(d_randstrobes, index.randstrobes.data(), index.randstrobes.size() * sizeof(RefRandstrobe), cudaMemcpyHostToDevice);
     cudaMemcpy(d_randstrobe_start_indices, index.randstrobe_start_indices.data(), index.randstrobe_start_indices.size() * sizeof(bucket_index_t), cudaMemcpyHostToDevice);
     std::cout << "memcpy execution time: " << GetTime() - t0 << " seconds" << std::endl;
+#else
+    t0 = GetTime();
+    cudaMalloc(&d_positions, num_queries * sizeof(size_t));
+    cudaMalloc(&d_queries, num_queries * sizeof(randstrobe_hash_t));
+    cudaMalloc(&d_randstrobes, index.randstrobes.size() * sizeof(RefRandstrobe));
+    cudaMalloc(&d_randstrobe_start_indices, index.randstrobe_start_indices.size() * sizeof(bucket_index_t));
+    cudaMemset(d_positions, 0, num_queries * sizeof(size_t));
+    cudaMemset(d_queries, 0, num_queries * sizeof(randstrobe_hash_t));
+    cudaMemset(d_randstrobes, 0, index.randstrobes.size() * sizeof(RefRandstrobe));
+    cudaMemset(d_randstrobe_start_indices, 0, index.randstrobe_start_indices.size() * sizeof(bucket_index_t));
+    std::cout << "malloc execution time: " << GetTime() - t0 << " seconds, size " << num_queries * sizeof(size_t) + num_queries * sizeof(randstrobe_hash_t) + index.randstrobes.size() * sizeof(RefRandstrobe) + index.randstrobe_start_indices.size() * sizeof(bucket_index_t) << std::endl;
+
+    t0 = GetTime();
+    cudaMemcpy(d_queries, queries.data(), num_queries * sizeof(randstrobe_hash_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_randstrobes, index.randstrobes.data(), index.randstrobes.size() * sizeof(RefRandstrobe), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_randstrobe_start_indices, index.randstrobe_start_indices.data(), index.randstrobe_start_indices.size() * sizeof(bucket_index_t), cudaMemcpyHostToDevice);
+    std::cout << "memcpy execution time: " << GetTime() - t0 << " seconds, size " << num_queries * sizeof(randstrobe_hash_t) + index.randstrobes.size() * sizeof(RefRandstrobe) + index.randstrobe_start_indices.size() * sizeof(bucket_index_t) << std::endl;
+#endif
 
     t0 = GetTime();
     int threads_per_block = 256;
@@ -338,11 +360,19 @@ int main(int argc, char** argv) {
     cudaDeviceSynchronize(); // Ensure all threads are finished
     std::cout << "synchronize execution time: " << GetTime() - t0 << " seconds" << std::endl;
 
+    t0 = GetTime();
+#ifdef use_managed
+    std::copy(d_positions, d_positions + num_queries, positions.begin());
+#else
+    cudaMemcpy(positions.data(), d_positions, num_queries * sizeof(size_t), cudaMemcpyDeviceToHost);
+#endif
+    std::cout << "memcpy back execution time: " << GetTime() - t0 << " seconds" << std::endl;
+
     size_t check_sum = 0;
     for (size_t i = 0; i < 10; ++i) {
         int id = rand() % num_queries;
-        std::cout << "Query " << id << ": Position " << d_positions[id] << std::endl;
-        check_sum += d_positions[id];
+        std::cout << "Query " << id << ": Position " << positions[id] << std::endl;
+        check_sum += positions[id];
     }
     std::cout << "check sum is " << check_sum << std::endl;
 
