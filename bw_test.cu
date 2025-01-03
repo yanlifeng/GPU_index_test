@@ -31,7 +31,7 @@ int main() {
 
     // Cleanup
     cudaFree(device_ptr);
-    free(host_ptr);
+    cudaFree(host_ptr);
 
     return 0;
 }

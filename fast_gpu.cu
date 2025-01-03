@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstring> // For strerror
 #include <sys/time.h>
+#include <omp.h>
 
 inline double GetTime() {
     struct timeval tv;
@@ -183,6 +184,47 @@ __global__ void gpu_find_single_thread(
 
 
 // GPU kernel for find
+__global__ void gpu_find_bs(
+        const RefRandstrobe* d_randstrobes,
+        const bucket_index_t* d_randstrobe_start_indices,
+        const randstrobe_hash_t* d_queries,
+        size_t* d_positions,
+        int num_queries,
+        int bits
+        ) {
+    int toffset = blockIdx.x * blockDim.x + threadIdx.x;
+    int sz = gridDim.x * blockDim.x;
+    for(int id = 0, tid = toffset; id < 32; id++, tid += sz) {
+        if (tid < num_queries) {
+            randstrobe_hash_t key = d_queries[tid];
+            const unsigned int top_N = key >> (64 - bits);
+            bucket_index_t position_start = d_randstrobe_start_indices[top_N];
+            bucket_index_t position_end = d_randstrobe_start_indices[top_N + 1];
+
+            //d_positions[tid] = position_end - position_start;
+
+            if (position_start == position_end) {
+                d_positions[tid] = static_cast<size_t>(-1); // No match
+                continue;
+                //return;
+            }
+
+            bool has_find = 0;
+            for (bucket_index_t i = position_start; i < position_end; ++i) {
+                if (d_randstrobes[i].hash == key) {
+                    d_positions[tid] = i;
+                    has_find = 1;
+                    break;
+                    //return;
+                }
+            }
+
+            if(has_find == 0) d_positions[tid] = static_cast<size_t>(-1); // No match
+        }
+    }
+}
+
+
 __global__ void gpu_find(
         const RefRandstrobe* d_randstrobes,
         const bucket_index_t* d_randstrobe_start_indices,
@@ -197,6 +239,8 @@ __global__ void gpu_find(
         const unsigned int top_N = key >> (64 - bits);
         bucket_index_t position_start = d_randstrobe_start_indices[top_N];
         bucket_index_t position_end = d_randstrobe_start_indices[top_N + 1];
+
+        //d_positions[tid] = position_end - position_start;
 
         if (position_start == position_end) {
             d_positions[tid] = static_cast<size_t>(-1); // No match
@@ -339,22 +383,24 @@ int main(int argc, char** argv) {
     cudaMemcpy(d_randstrobe_start_indices, index.randstrobe_start_indices.data(), index.randstrobe_start_indices.size() * sizeof(bucket_index_t), cudaMemcpyHostToDevice);
     std::cout << "memcpy1 execution time: " << GetTime() - t0 << " seconds, size " << index.randstrobes.size() * sizeof(RefRandstrobe) + index.randstrobe_start_indices.size() * sizeof(bucket_index_t) << std::endl;
 
-    t0 = GetTime();
-    cudaMemcpy(d_queries, h_queries, num_queries * sizeof(randstrobe_hash_t), cudaMemcpyHostToDevice);
-    std::cout << "memcpy2 execution time: " << GetTime() - t0 << " seconds, size " << num_queries * sizeof(randstrobe_hash_t) << std::endl;
+    for(int i = 0; i < 10; i++) {
+        t0 = GetTime();
+        cudaMemcpy(d_queries, h_queries, num_queries * sizeof(randstrobe_hash_t), cudaMemcpyHostToDevice);
+        std::cout << "memcpy2 execution time: " << GetTime() - t0 << " seconds, size " << num_queries * sizeof(randstrobe_hash_t) << std::endl;
 
-    t0 = GetTime();
-    int threads_per_block = 256;
-    int blocks_per_grid = (num_queries + threads_per_block - 1) / threads_per_block;
-    gpu_find<<<blocks_per_grid, threads_per_block>>>(d_randstrobes, d_randstrobe_start_indices, d_queries, d_positions, num_queries, index.bits);
-    cudaDeviceSynchronize(); // Ensure all threads are finished
-    std::cout << "synchronize execution time: " << GetTime() - t0 << " seconds" << std::endl;
+        t0 = GetTime();
+        int threads_per_block = 256;
+        int blocks_per_grid = (num_queries + threads_per_block - 1) / threads_per_block;
+        gpu_find<<<blocks_per_grid, threads_per_block>>>(d_randstrobes, d_randstrobe_start_indices, d_queries, d_positions, num_queries, index.bits);
+        //gpu_find_bs<<<blocks_per_grid / 32, threads_per_block>>>(d_randstrobes, d_randstrobe_start_indices, d_queries, d_positions, num_queries, index.bits);
+        cudaDeviceSynchronize(); // Ensure all threads are finished
+        std::cout << "synchronize execution time: " << GetTime() - t0 << " seconds" << std::endl;
 
-    t0 = GetTime();
-    cudaMemcpy(h_positions, d_positions, num_queries * sizeof(size_t), cudaMemcpyDeviceToHost);
-    std::cout << "memcpy back execution time: " << GetTime() - t0 << " seconds" << std::endl;
+        t0 = GetTime();
+        cudaMemcpy(h_positions, d_positions, num_queries * sizeof(size_t), cudaMemcpyDeviceToHost);
+        std::cout << "memcpy back execution time: " << GetTime() - t0 << " seconds" << std::endl;
+    }
 
-    
     size_t check_sum = 0;
     for (size_t i = 0; i < 10; ++i) {
         int id = rand() % num_queries;
