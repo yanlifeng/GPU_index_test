@@ -194,7 +194,6 @@ public:
         const unsigned int top_N = key >> (64 - bits);
         bucket_index_t position_start = randstrobe_start_indices[top_N];
         bucket_index_t position_end = randstrobe_start_indices[top_N + 1];
-
         return position_end - position_start;
         //std::cout << "top_N: " << top_N << ", range: " << position_start << " " << position_end << std::endl;
 
@@ -273,18 +272,22 @@ int main(int argc, char** argv) {
 	std::vector<randstrobe_hash_t> queries = readFileToVector("seed_info.txt");
 	int num_queries = queries.size();
 	printf("size %d, data[0] %lu\n", num_queries, queries[0]);
-    std::vector<size_t> positions(num_queries);
+    size_t* h_queries = (size_t*)malloc(num_queries * sizeof(size_t));
+    size_t* h_positions = (size_t*)malloc(num_queries * sizeof(size_t));
+
+#pragma omp parallel for num_threads(32)
+    for(int i = 0; i < num_queries; i++) {
+        h_queries[i] = queries[i];
+        h_positions[i] = 0;
+    }
 
     // Start timing
     auto start = std::chrono::high_resolution_clock::now();
 
     // Perform find for each query
-#pragma omp parallel for num_threads(48)
+#pragma omp parallel for num_threads(32)
     for (int i = 0; i < num_queries; ++i) {
-        positions[i] = index.find(queries[i]);
-        //if(positions[i] != static_cast<size_t>(-1)) {
-        //    std::cout << "match " << queries[i] << std::endl;
-        //}
+        h_positions[i] = index.find(h_queries[i]);
     }
 
     // Stop timing
@@ -298,8 +301,8 @@ int main(int argc, char** argv) {
     // Output part of the results (first 10 for brevity)
     for (size_t i = 0; i < 10; ++i) {
         int id = rand() % num_queries;
-        std::cout << "Query " << id << ": Position " << positions[id] << std::endl;
-        check_sum += positions[id];
+        std::cout << "Query " << id << ": Position " << h_positions[id] << std::endl;
+        check_sum += h_positions[id];
     }
 
     std::cout << "check sum is " << check_sum << std::endl;
