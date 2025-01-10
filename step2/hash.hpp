@@ -100,9 +100,10 @@
 #define XXH_PRIME64_4  0x85EBCA77C2B2AE63ULL  /*!< 0b1000010111101011110010100111011111000010101100101010111001100011 */
 #define XXH_PRIME64_5  0x27D4EB2F165667C5ULL  /*!< 0b0010011111010100111010110010111100010110010101100110011111000101 */
 
+#include <cuda_runtime.h>
 
 /// xxh64, but it can only be used for a single u64
-uint64_t xxh64(uint64_t input) {
+__host__ __device__ static inline uint64_t xxh64(uint64_t input) {
     uint64_t result = XXH_PRIME64_5 + 8;
     input *= XXH_PRIME64_2;
     input = XXH_rotl64(input, 31);

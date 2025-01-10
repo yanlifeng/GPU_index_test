@@ -1,8 +1,8 @@
 # Compiler and flags
 CXX = g++
 NVCC = nvcc
-CXXFLAGS = -std=c++17 -O0 -w -g
-NVCCFLAGS = -std=c++17 -O0 -w -g
+CXXFLAGS = -std=c++17 -O3 -w -g
+NVCCFLAGS = -std=c++17 -O3 -w -arch=sm_86 -g
 
 
 # Directories

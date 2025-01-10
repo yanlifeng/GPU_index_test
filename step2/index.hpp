@@ -159,8 +159,8 @@ struct StrobemerIndex {
     }
 
 public:
-    void assign_all_randstrobes(const std::vector<uint64_t>& randstrobe_counts, size_t n_threads);
-    void assign_randstrobes(size_t ref_index, size_t offset);
+//    void assign_all_randstrobes(const std::vector<uint64_t>& randstrobe_counts, size_t n_threads);
+//    void assign_randstrobes(size_t ref_index, size_t offset);
 
     const IndexParameters& parameters;
     const References& references;

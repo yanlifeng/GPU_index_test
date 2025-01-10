@@ -1,0 +1,29 @@
+file name: /home/user_home/ylf/data/A.fasta.r100.sti
+file_format_version: 2
+read file : /home/user_home/ylf/data/p1.fq /home/user_home/ylf/data/p2.fq
+read file done, 25000 25000
+tot_len : 2500000
+pre_sum : 2500000
+host memcpy cost 0.00143003
+5476848
+malloc1 execution time: 0.410546 seconds, size 6525432
+memcpy1 execution time: 0.00163507 seconds, size 6525432
+malloc2 execution time: 0.000118017 seconds, size 2600000
+memcpy2 execution time: 0.000712872 seconds, size 2600000
+buffer malloc execution time: 0.000852823
+read num 25000
+blocks_per_grid 25000
+GPU run cost 0.0574601
+size tot 0, avg : 0
+Query 14383: Position 0 0
+Query 5886: Position 0 0
+Query 17777: Position 0 0
+Query 11915: Position 0 0
+Query 22793: Position 0 0
+Query 13335: Position 0 0
+Query 10386: Position 0 0
+Query 10492: Position 0 0
+Query 16649: Position 0 0
+Query 16421: Position 0 0
+check sum is 0
+free execution time: 1.90735e-06 seconds
