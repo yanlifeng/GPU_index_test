@@ -28,10 +28,7 @@
 #include "logger.hpp"
 #include "pc.hpp"
 #include "readlen.hpp"
-
 #include "my_struct.hpp"
-
-#include <thrust/device_vector.h>
 
 #define my_bucket_index_t StrobemerIndex::bucket_index_t
 
@@ -41,7 +38,7 @@ inline double GetTime() {
     return (double) tv.tv_sec + (double) tv.tv_usec / 1000000;
 }
 
-InputBuffer get_input_buffer(const CommandLineOptions& opt) {
+InputBuffer get_input_buffer(const CommandLineOptions &opt) {
     if (opt.is_SE) {
         return InputBuffer(opt.reads_filename1, "", opt.chunk_size, false);
 
@@ -59,7 +56,8 @@ InputBuffer get_input_buffer(const CommandLineOptions& opt) {
 
 }
 
-int producer_pe_fastq_task(std::string file, std::string file2, rabbit::fq::FastqDataPool &fastqPool, rabbit::core::TDataQueue<rabbit::fq::FastqDataPairChunk> &dq) {
+int producer_pe_fastq_task(std::string file, std::string file2, rabbit::fq::FastqDataPool &fastqPool,
+                           rabbit::core::TDataQueue<rabbit::fq::FastqDataPairChunk> &dq) {
     rabbit::fq::FastqFileReader *fqFileReader;
     fqFileReader = new rabbit::fq::FastqFileReader(file, fastqPool, false, file2);
     int n_chunks = 0;
@@ -80,207 +78,286 @@ int producer_pe_fastq_task(std::string file, std::string file2, rabbit::fq::Fast
 }
 
 
+__device__ randstrobe_hash_t
+gpu_get_hash(const RefRandstrobe *d_randstrobes, size_t d_randstrobes_size, my_bucket_index_t position) {
+    if (position < d_randstrobes_size) {
+        return d_randstrobes[position].hash;
+    } else {
+        return static_cast<randstrobe_hash_t>(-1);
+    }
+}
 
+__device__ bool
+gpu_is_filtered(const RefRandstrobe *d_randstrobes, size_t d_randstrobes_size, my_bucket_index_t position,
+                unsigned int filter_cutoff) {
+    return gpu_get_hash(d_randstrobes, d_randstrobes_size, position) ==
+           gpu_get_hash(d_randstrobes, d_randstrobes_size, position + filter_cutoff);
+}
+
+__device__ size_t gpu_find(
+        const RefRandstrobe *d_randstrobes,
+        const my_bucket_index_t *d_randstrobe_start_indices,
+        const randstrobe_hash_t key,
+        int bits
+) {
+    const unsigned int top_N = key >> (64 - bits);
+    my_bucket_index_t position_start = d_randstrobe_start_indices[top_N];
+    my_bucket_index_t position_end = d_randstrobe_start_indices[top_N + 1];
+    if (position_start == position_end) {
+        return static_cast<size_t>(-1); // No match
+    }
+    for (my_bucket_index_t i = position_start; i < position_end; ++i) {
+        if (d_randstrobes[i].hash == key) {
+            return i;
+        }
+    }
+    return static_cast<size_t>(-1); // No match
+}
+
+__device__ int lock = 0;
+
+__device__ void acquire_lock() {
+    while (atomicCAS(&lock, 0, 1) != 0) {
+    }
+}
+
+__device__ void release_lock() {
+    atomicExch(&lock, 0);
+}
+
+#define GPU_read_block_size 1
 
 __global__ void gpu_step2(
-        const RefRandstrobe* d_randstrobes,
-        const my_bucket_index_t* d_randstrobe_start_indices,
+        int bits,
+        unsigned int filter_cutoff,
+        const RefRandstrobe *d_randstrobes,
+        size_t d_randstrobes_size,
+        const my_bucket_index_t *d_randstrobe_start_indices,
         int num_reads,
-        int* pre_sum,
-        int* lens,
-        char* all_seqs,
-        IndexParameters* index_para,
-        int* randstrobe_sizes, 
+        int *pre_sum,
+        int *lens,
+        char *all_seqs,
+        int *pre_sum2,
+        int *lens2,
+        char *all_seqs2,
+        IndexParameters *index_para,
+        int *randstrobe_sizes,
         uint64_t *hashes,
-        my_pool* mpools
+        my_pool *mpools,
+        uint64_t *global_total_hits,
+        uint64_t *global_nr_good_hits
 ) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    //if(tid == 0) {
-    //    printf("num_reads %d\n", num_reads);
-    //}
-    if(tid < num_reads) {
-        my_pool mpool = mpools[tid];
+    int b_tid = blockIdx.x * blockDim.x + threadIdx.x;
 
-        unsigned long long t_time;
-        unsigned long long t_timed[100];
-        int t_pos = 0;
+    int l_range = b_tid * GPU_read_block_size;
+    int r_range = l_range + GPU_read_block_size;
+    if (r_range > num_reads) r_range = num_reads;
 
-        unsigned long long t_start = clock64();
+//#define use_my_time
 
-        size_t len = lens[tid];
-        char* seq = all_seqs + pre_sum[tid];
+#ifdef use_my_time
+    unsigned long long t_time1 = 0;
+    unsigned long long t_time2 = 0;
+    unsigned long long t_time3 = 0;
+    unsigned long long t_timed[100] = {0};
+    int t_pos = 0;
+#endif
 
-        //if(tid == 0) {
-        //    printf("len %d\n", len);
-        //    //for(int i = 0; i < len; i++) printf("%c", seq[i]);
-        //    //printf("\n");
-        //} //else return;
+    for (int tid = l_range; tid < r_range; tid++) {
 
-        // step1: get randstrobes
-        unsigned long long t_start1;
+        for (int rev = 0; rev < 2; rev++) {
 
-        t_start1 = clock64();
-        my_vector<QueryRandstrobe> randstrobes(&mpool);
-        t_timed[t_pos++] = clock64() - t_start1;
 
-        t_start1 = clock64();
-        my_vector<Syncmer> syncmers(&mpool);
-        t_timed[t_pos++] = clock64() - t_start1;
+#ifdef use_my_time
+            unsigned long long t_start = clock64();
+#endif
+            my_pool mpool = mpools[tid];
 
-        t_start1 = clock64();
-        my_vector<uint64_t> vec4syncmers(&mpool);
-        t_timed[t_pos++] = clock64() - t_start1;
-        if (len < (*index_para).randstrobe.w_max) {
-            // randstrobes == null
-        } else {
-            t_start1 = clock64();
-            SyncmerIterator syncmer_iterator{&vec4syncmers, seq, len, (*index_para).syncmer};
-            Syncmer syncmer;
-            while (1) {
-                syncmer = syncmer_iterator.gpu_next();
-                if(syncmer.is_end()) break;
-                syncmers.push_back(syncmer);
-                //printf("syncmer %llu %lld\n", syncmer.hash, syncmer.position);
+            size_t len;
+            char *seq;
+            if (rev == 0) {
+                len = lens[tid];
+                seq = all_seqs + pre_sum[tid];
+            } else {
+                len = lens2[tid];
+                seq = all_seqs2 + pre_sum2[tid];
             }
-            t_timed[t_pos++] = clock64() - t_start1;
 
-            if (syncmers.size() == 0) {
+            // step1: get randstrobes
+            unsigned long long t_start1;
+#ifdef use_my_time
+            t_start1 = clock64();
+#endif
+            my_vector<QueryRandstrobe> randstrobes(&mpool);
+#ifdef use_my_time
+            //        t_timed[t_pos++] += clock64() - t_start1;
+#endif
+
+#ifdef use_my_time
+            t_start1 = clock64();
+#endif
+            my_vector<Syncmer> syncmers(&mpool);
+#ifdef use_my_time
+            //        t_timed[t_pos++] += clock64() - t_start1;
+#endif
+
+#ifdef use_my_time
+            t_start1 = clock64();
+#endif
+            my_vector<uint64_t> vec4syncmers(&mpool);
+#ifdef use_my_time
+            //        t_timed[t_pos++] += clock64() - t_start1;
+#endif
+            if (len < (*index_para).randstrobe.w_max) {
                 // randstrobes == null
             } else {
+#ifdef use_my_time
                 t_start1 = clock64();
-                RandstrobeIterator randstrobe_fwd_iter{&syncmers, (*index_para).randstrobe};
-                while (randstrobe_fwd_iter.gpu_has_next()) {
-                    Randstrobe randstrobe = randstrobe_fwd_iter.gpu_next();
-                    //printf("value %llu %u %u\n", randstrobe.hash, randstrobe.strobe1_pos, randstrobe.strobe2_pos + (*index_para).syncmer.k);
-                    randstrobes.push_back(
-                            QueryRandstrobe{
-                                    randstrobe.hash, randstrobe.strobe1_pos, randstrobe.strobe2_pos + (*index_para).syncmer.k, false
-                            }
-                    );
+#endif
+                SyncmerIterator syncmer_iterator{&vec4syncmers, seq, len, (*index_para).syncmer};
+                Syncmer syncmer;
+                while (1) {
+                    syncmer = syncmer_iterator.gpu_next();
+                    if (syncmer.is_end()) break;
+                    syncmers.push_back(syncmer);
                 }
-                t_timed[t_pos++] = clock64() - t_start1;
+#ifdef use_my_time
+                //            t_timed[t_pos++] += clock64() - t_start1;
+#endif
 
-                t_start1 = clock64();
-                for(int i = 0; i < syncmers.size() / 2; i++) {
-                    my_swap(syncmers[i], syncmers[syncmers.size() - i - 1]);
-                }
-                for (size_t i = 0; i < syncmers.size(); i++) {
-                    syncmers[i].position = len - syncmers[i].position - (*index_para).syncmer.k;
-                }
-                t_timed[t_pos++] = clock64() - t_start1;
+                if (syncmers.size() == 0) {
+                    // randstrobes == null
+                } else {
+#ifdef use_my_time
+                    t_start1 = clock64();
+#endif
+                    RandstrobeIterator randstrobe_fwd_iter{&syncmers, (*index_para).randstrobe};
+                    while (randstrobe_fwd_iter.gpu_has_next()) {
+                        Randstrobe randstrobe = randstrobe_fwd_iter.gpu_next();
+                        randstrobes.push_back(
+                                QueryRandstrobe{
+                                        randstrobe.hash, randstrobe.strobe1_pos,
+                                        randstrobe.strobe2_pos + (*index_para).syncmer.k, false
+                                }
+                        );
+                    }
+#ifdef use_my_time
+                    //                t_timed[t_pos++] += clock64() - t_start1;
+#endif
 
-                t_start1 = clock64();
-                RandstrobeIterator randstrobe_rc_iter{&syncmers, (*index_para).randstrobe};
-                while (randstrobe_rc_iter.gpu_has_next()) {
-                    Randstrobe randstrobe = randstrobe_rc_iter.gpu_next();
-                    //printf("value %llu %u %u\n", randstrobe.hash, randstrobe.strobe1_pos, randstrobe.strobe2_pos + (*index_para).syncmer.k);
-                    randstrobes.push_back(
-                            QueryRandstrobe{
-                                    randstrobe.hash, randstrobe.strobe1_pos, randstrobe.strobe2_pos + (*index_para).syncmer.k, true
-                            }
-                    );
+#ifdef use_my_time
+                    t_start1 = clock64();
+#endif
+                    for (int i = 0; i < syncmers.size() / 2; i++) {
+                        my_swap(syncmers[i], syncmers[syncmers.size() - i - 1]);
+                    }
+                    for (size_t i = 0; i < syncmers.size(); i++) {
+                        syncmers[i].position = len - syncmers[i].position - (*index_para).syncmer.k;
+                    }
+#ifdef use_my_time
+                    //                t_timed[t_pos++] += clock64() - t_start1;
+#endif
+
+#ifdef use_my_time
+                    t_start1 = clock64();
+#endif
+                    RandstrobeIterator randstrobe_rc_iter{&syncmers, (*index_para).randstrobe};
+                    while (randstrobe_rc_iter.gpu_has_next()) {
+                        Randstrobe randstrobe = randstrobe_rc_iter.gpu_next();
+                        randstrobes.push_back(
+                                QueryRandstrobe{
+                                        randstrobe.hash, randstrobe.strobe1_pos,
+                                        randstrobe.strobe2_pos + (*index_para).syncmer.k, true
+                                }
+                        );
+                    }
+#ifdef use_my_time
+                    //                t_timed[t_pos++] += clock64() - t_start1;
+#endif
                 }
-                t_timed[t_pos++] = clock64() - t_start1;
             }
-        }
-
-//        t_start1 = clock64();
-//        randstrobes.~my_vector<QueryRandstrobe>();
-//        t_timed[t_pos++] = clock64() - t_start1;
-//
-//        t_start1 = clock64();
-//        syncmers.~my_vector<Syncmer>();
-//        t_timed[t_pos++] = clock64() - t_start1;
-//
-//        t_start1 = clock64();
-//        vec4syncmers.~my_vector<uint64_t>();
-//        t_timed[t_pos++] = clock64() - t_start1;
-
-        t_time = clock64() - t_start;
-        //if(tid % 5000 == 0) {
-        //    printf("Task %u took %llu : ( ", tid, blockIdx.x % gridDim.x, t_time);
-        //    for(int i = 0; i < t_pos; i++) printf("%llu + ", t_timed[i]);
-        //    printf(")\n");
-        //}
-
-//        if(tid % 10000 == 0) printf("tid %d get %d randstrobes\n", tid, randstrobes.size());
-        randstrobe_sizes[tid] = randstrobes.size();
-        if(randstrobes.size() > 0) hashes[tid] = randstrobes[0].hash;
-        //printf("randstrobes size %d\n", randstrobes.size());
-
-        // step2: get nams
+#ifdef use_my_time
+            t_time1 += clock64() - t_start;
+#endif
 
 
+#ifdef use_my_time
+            t_start = clock64();
+#endif
+            randstrobe_sizes[tid] += randstrobes.size();
+            for (int i = 0; i < randstrobes.size(); i++) hashes[tid] += randstrobes[i].hash;
+//        if(randstrobes.size() > 0) hashes[tid] = randstrobes[randstrobes.size() / 2].hash;
+#ifdef use_my_time
+            t_time2 += clock64() - t_start;
+#endif
 
 
-    }
-}
+            // step2: get nams
 
-
-__global__ void gpu_find(
-    const RefRandstrobe* d_randstrobes,
-    const my_bucket_index_t* d_randstrobe_start_indices,
-    const randstrobe_hash_t* d_queries,
-    size_t* d_positions,
-    int num_queries,
-    int bits
-) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid < num_queries) {
-        randstrobe_hash_t key = d_queries[tid];
-        const unsigned int top_N = key >> (64 - bits);
-        my_bucket_index_t position_start = d_randstrobe_start_indices[top_N];
-        my_bucket_index_t position_end = d_randstrobe_start_indices[top_N + 1];
-
-        //d_positions[tid] = position_end - position_start;
-
-        if (position_start == position_end) {
-            d_positions[tid] = static_cast<size_t>(-1); // No match
-            return;
-        }
-
-        for (my_bucket_index_t i = position_start; i < position_end; ++i) {
-            if (d_randstrobes[i].hash == key) {
-                d_positions[tid] = i;
-                return;
+#ifdef use_my_time
+            t_start = clock64();
+#endif
+//        __shared__ uint64_t shared_total_hits;
+//        __shared__ uint64_t shared_nr_good_hits;
+//        if (threadIdx.x == 0) {
+//            shared_total_hits = 0;
+//            shared_nr_good_hits = 0;
+//        }
+//        __syncthreads();
+            uint64_t local_total_hits = 0;
+            uint64_t local_nr_good_hits = 0;
+            for (int i = 0; i < randstrobes.size(); i++) {
+                QueryRandstrobe q = randstrobes[i];
+                size_t position = gpu_find(d_randstrobes, d_randstrobe_start_indices, q.hash, bits);
+                if (position != static_cast<size_t>(-1)) {
+//                atomicAdd((unsigned long long int*)&shared_total_hits, 1ULL);
+                    local_total_hits++;
+                    bool res = gpu_is_filtered(d_randstrobes, d_randstrobes_size, position, filter_cutoff);
+                    if (res) {
+                        continue;
+                    }
+                    local_nr_good_hits++;
+//                atomicAdd((unsigned long long int*)&shared_nr_good_hits, 1ULL);
+                    // TODO
+//                add_to_hits_per_ref(hits_per_ref[q.is_reverse], q.start, q.end, index, position);
+                }
             }
-        }
+            global_total_hits[tid] = local_total_hits;
+            global_nr_good_hits[tid] = local_nr_good_hits;
+#ifdef use_my_time
+            t_time3 += clock64() - t_start;
+#endif
 
-        d_positions[tid] = static_cast<size_t>(-1); // No match
-    }
-}
-
-
-
-
-std::vector<uint64_t> readFileToVector(const std::string& filename) {
-    std::vector<uint64_t> data;
-    std::ifstream infile(filename);
-
-    if (!infile.is_open()) {
-        throw std::runtime_error("Failed to open file: " + filename);
-    }
-
-    std::string line;
-    while (std::getline(infile, line)) {
-        std::istringstream iss(line);
-        uint64_t value;
-        while (iss >> value) {
-            data.push_back(value);
+//            __syncthreads();
+//            if (threadIdx.x == 0) {
+//                atomicAdd((unsigned long long int *) global_total_hits, shared_total_hits);
+//                atomicAdd((unsigned long long int *) global_nr_good_hits, shared_nr_good_hits);
+//            }
         }
     }
 
-    infile.close();
-    return data;
+#ifdef use_my_time
+    if(b_tid % 10000 == 0) {
+        acquire_lock();
+        printf("btid %d, [%d %d], time %.3f %.3f %.3f : ( ", b_tid, l_range, r_range, t_time1 / 1e6, t_time2 / 1e6, t_time3 / 1e6);
+        for(int i = 0; i < t_pos; i++) {
+            printf("%.3f ", t_timed[i] / 1e6);
+        }
+        printf(" )\n");
+        release_lock();
+    }
+#endif
+
 }
+
 
 klibpp::KSeq ConvertNeo2KSeq(neoReference ref) {
     klibpp::KSeq res;
     res.name = std::string((char *) ref.base + ref.pname, ref.lname);
-    if(!res.name.empty()) {
+    if (!res.name.empty()) {
         size_t space_pos = res.name.find(' ');
         int l_pos = 0;
-        if(res.name[0] == '@') l_pos = 1;
+        if (res.name[0] == '@') l_pos = 1;
         if (space_pos != std::string::npos) {
             res.name = res.name.substr(l_pos, space_pos - l_pos);
         } else {
@@ -293,10 +370,10 @@ klibpp::KSeq ConvertNeo2KSeq(neoReference ref) {
     return res;
 }
 
-static Logger& logger = Logger::get();
+static Logger &logger = Logger::get();
 
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
     auto opt = parse_command_line_arguments(argc, argv);
 
     InputBuffer input_buffer = get_input_buffer(opt);
@@ -307,13 +384,13 @@ int main(int argc, char** argv) {
     }
 
     IndexParameters index_parameters = IndexParameters::from_read_length(
-        opt.r,
-        opt.k_set ? opt.k : IndexParameters::DEFAULT,
-        opt.s_set ? opt.s : IndexParameters::DEFAULT,
-        opt.l_set ? opt.l : IndexParameters::DEFAULT,
-        opt.u_set ? opt.u : IndexParameters::DEFAULT,
-        opt.c_set ? opt.c : IndexParameters::DEFAULT,
-        opt.max_seed_len_set ? opt.max_seed_len : IndexParameters::DEFAULT
+            opt.r,
+            opt.k_set ? opt.k : IndexParameters::DEFAULT,
+            opt.s_set ? opt.s : IndexParameters::DEFAULT,
+            opt.l_set ? opt.l : IndexParameters::DEFAULT,
+            opt.u_set ? opt.u : IndexParameters::DEFAULT,
+            opt.c_set ? opt.c : IndexParameters::DEFAULT,
+            opt.max_seed_len_set ? opt.max_seed_len : IndexParameters::DEFAULT
     );
 
     std::string index_file_path = argv[1];
@@ -335,7 +412,8 @@ int main(int argc, char** argv) {
     rabbit::fq::FastqDataPool fastqPool(1024, 1 << 22);
     rabbit::core::TDataQueue<rabbit::fq::FastqDataPairChunk> queue_pe(1024, 1);
     std::thread *producer;
-    producer = new std::thread(producer_pe_fastq_task, opt.reads_filename1, opt.reads_filename2, std::ref(fastqPool), std::ref(queue_pe));
+    producer = new std::thread(producer_pe_fastq_task, opt.reads_filename1, opt.reads_filename2, std::ref(fastqPool),
+                               std::ref(queue_pe));
 
     std::vector<neoReference> data1;
     std::vector<neoReference> data2;
@@ -343,13 +421,13 @@ int main(int argc, char** argv) {
     std::vector<klibpp::KSeq> records1;
     std::vector<klibpp::KSeq> records2;
     long long id;
-    while(queue_pe.Pop(id, fqdatachunk)) {
+    while (queue_pe.Pop(id, fqdatachunk)) {
         data1.clear();
         data2.clear();
-        rabbit::fq::chunkFormat((rabbit::fq::FastqDataChunk*)(fqdatachunk->left_part), data1);
-        rabbit::fq::chunkFormat((rabbit::fq::FastqDataChunk*)(fqdatachunk->right_part), data2);
+        rabbit::fq::chunkFormat((rabbit::fq::FastqDataChunk *) (fqdatachunk->left_part), data1);
+        rabbit::fq::chunkFormat((rabbit::fq::FastqDataChunk *) (fqdatachunk->right_part), data2);
         assert(data1.size() == data2.size());
-        for(int i = 0; i < data1.size(); i++) {
+        for (int i = 0; i < data1.size(); i++) {
             auto item1 = data1[i];
             auto item2 = data2[i];
             records1.push_back(ConvertNeo2KSeq(item1));
@@ -364,198 +442,171 @@ int main(int argc, char** argv) {
     double t0;
 
     t0 = GetTime();
-    RefRandstrobe* d_randstrobes;
-    my_bucket_index_t* d_randstrobe_start_indices;
+    RefRandstrobe *d_randstrobes;
+    my_bucket_index_t *d_randstrobe_start_indices;
     std::cout << index.randstrobes.size() * sizeof(RefRandstrobe) << std::endl;
     cudaMalloc(&d_randstrobes, index.randstrobes.size() * sizeof(RefRandstrobe));
     cudaMalloc(&d_randstrobe_start_indices, index.randstrobe_start_indices.size() * sizeof(my_bucket_index_t));
     cudaMemset(d_randstrobes, 0, index.randstrobes.size() * sizeof(RefRandstrobe));
     cudaMemset(d_randstrobe_start_indices, 0, index.randstrobe_start_indices.size() * sizeof(my_bucket_index_t));
-    std::cout << "malloc1 execution time: " << GetTime() - t0 << " seconds, size " << index.randstrobes.size() * sizeof(RefRandstrobe) + index.randstrobe_start_indices.size() * sizeof(my_bucket_index_t) << std::endl;
+    std::cout << "malloc1 execution time: " << GetTime() - t0 << " seconds, size "
+              << index.randstrobes.size() * sizeof(RefRandstrobe) +
+                 index.randstrobe_start_indices.size() * sizeof(my_bucket_index_t) << std::endl;
 
     t0 = GetTime();
-    cudaMemcpy(d_randstrobes, index.randstrobes.data(), index.randstrobes.size() * sizeof(RefRandstrobe), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_randstrobe_start_indices, index.randstrobe_start_indices.data(), index.randstrobe_start_indices.size() * sizeof(my_bucket_index_t), cudaMemcpyHostToDevice);
-    std::cout << "memcpy1 execution time: " << GetTime() - t0 << " seconds, size " << index.randstrobes.size() * sizeof(RefRandstrobe) + index.randstrobe_start_indices.size() * sizeof(my_bucket_index_t) << std::endl;
+    cudaMemcpy(d_randstrobes, index.randstrobes.data(), index.randstrobes.size() * sizeof(RefRandstrobe),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_randstrobe_start_indices, index.randstrobe_start_indices.data(),
+               index.randstrobe_start_indices.size() * sizeof(my_bucket_index_t), cudaMemcpyHostToDevice);
+    std::cout << "memcpy1 execution time: " << GetTime() - t0 << " seconds, size "
+              << index.randstrobes.size() * sizeof(RefRandstrobe) +
+                 index.randstrobe_start_indices.size() * sizeof(my_bucket_index_t) << std::endl;
 
 #define batch_size 25000
 #define batch_seq_szie batch_size * 250ll
 
     t0 = GetTime();
-    char* d_mpools_data;
+    char *d_mpools_data;
     cudaMalloc(&d_mpools_data, batch_size * vec_block_size);
     cudaMemset(d_mpools_data, 0, batch_size * vec_block_size);
     printf("device addr %p\n", d_mpools_data);
-    my_pool* h_mpools = new my_pool[batch_size];
-    for(int i = 0; i < batch_size; i++) {
+    my_pool *h_mpools = new my_pool[batch_size];
+    for (int i = 0; i < batch_size; i++) {
         h_mpools[i].size = vec_block_size;
         h_mpools[i].data = d_mpools_data + i * vec_block_size;
-        if(i < 10) printf("%p\n", h_mpools[i].data);
     }
-    my_pool* d_mpools;
+    my_pool *d_mpools;
     cudaMalloc(&d_mpools, batch_size * sizeof(my_pool));
     std::cout << "buffer malloc execution time: " << GetTime() - t0 << std::endl;
 
-    int* a_randstrobe_sizes;
+    int *a_randstrobe_sizes;
     cudaMallocManaged(&a_randstrobe_sizes, batch_size * sizeof(int));
-    uint64_t* a_hashes;
+    uint64_t * a_hashes;
     cudaMallocManaged(&a_hashes, batch_size * sizeof(uint64_t));
 
     t0 = GetTime();
-    char* d_seq;
-    int* d_len;
-    int* d_pre_sum;
+    char *d_seq;
+    int *d_len;
+    int *d_pre_sum;
     cudaMalloc(&d_seq, batch_seq_szie);
     cudaMemset(d_seq, 0, batch_seq_szie);
     cudaMalloc(&d_len, batch_size * sizeof(int));
     cudaMemset(d_len, 0, batch_size * sizeof(int));
     cudaMalloc(&d_pre_sum, batch_size * sizeof(int));
     cudaMemset(d_pre_sum, 0, batch_size * sizeof(int));
-    std::cout << "malloc2 execution time: " << GetTime() - t0 << " seconds, size " << batch_seq_szie + batch_size * sizeof(int) << std::endl;
 
-    IndexParameters* d_index_para;
+    char *d_seq2;
+    int *d_len2;
+    int *d_pre_sum2;
+    cudaMalloc(&d_seq2, batch_seq_szie);
+    cudaMemset(d_seq2, 0, batch_seq_szie);
+    cudaMalloc(&d_len2, batch_size * sizeof(int));
+    cudaMemset(d_len2, 0, batch_size * sizeof(int));
+    cudaMalloc(&d_pre_sum2, batch_size * sizeof(int));
+    cudaMemset(d_pre_sum2, 0, batch_size * sizeof(int));
+    std::cout << "malloc2 execution time: " << GetTime() - t0 << " seconds, size "
+              << batch_seq_szie + batch_size * sizeof(int) << std::endl;
+
+    IndexParameters *d_index_para;
     cudaMalloc(&d_index_para, sizeof(IndexParameters));
-     
 
-    int* h_len = new int[batch_size];
-    int* h_pre_sum = new int[batch_size + 1];
-    char* h_seq = new char[batch_seq_szie];
+
+    int *h_len = new int[batch_size];
+    int *h_pre_sum = new int[batch_size + 1];
+    char *h_seq = new char[batch_seq_szie];
+
+    int *h_len2 = new int[batch_size];
+    int *h_pre_sum2 = new int[batch_size + 1];
+    char *h_seq2 = new char[batch_seq_szie];
 
     double gpu_cost = 0;
+    double tot_cost = 0;
     size_t check_sum = 0;
     size_t size_tot = 0;
-        
-    for(int l_id = 0; l_id < records1.size(); l_id += batch_size) {
 
+    uint64_t h_global_total_hits = 0;
+    uint64_t * a_global_total_hits;
+    cudaMallocManaged(&a_global_total_hits, batch_size * sizeof(uint64_t));
+
+    uint64_t h_global_nr_good_hits = 0;
+    uint64_t * a_global_nr_good_hits;
+    cudaMallocManaged(&a_global_nr_good_hits, batch_size * sizeof(uint64_t));
+
+    assert(records1.size() == records2.size());
+
+    t0 = GetTime();
+    for (int l_id = 0; l_id < records1.size(); l_id += batch_size) {
         int r_id = l_id + batch_size;
-        if(r_id > records1.size()) r_id = records1.size();
+        if (r_id > records1.size()) r_id = records1.size();
         int s_len = r_id - l_id;
-        //printf("[%d %d] -- %d\n", l_id, r_id, s_len);
-
 
         uint64_t tot_len = 0;
+        uint64_t tot_len2 = 0;
         h_pre_sum[0] = 0;
-        for(int i = l_id; i < r_id; i++) {
+        h_pre_sum2[0] = 0;
+        for (int i = l_id; i < r_id; i++) {
             tot_len += records1[i].seq.length();
+            tot_len2 += records2[i].seq.length();
             h_len[i - l_id] = records1[i].seq.length();
+            h_len2[i - l_id] = records2[i].seq.length();
             h_pre_sum[i + 1 - l_id] = h_pre_sum[i - l_id] + h_len[i - l_id];
+            h_pre_sum2[i + 1 - l_id] = h_pre_sum2[i - l_id] + h_len2[i - l_id];
         }
-
-        //std::cout << "tot_len : " << tot_len << std::endl;
-        //std::cout << "pre_sum : " << h_pre_sum[s_len] << std::endl;
-
-        memset(h_seq, 0, tot_len);
-
-        t0 = GetTime();
+//        memset(h_seq, 0, tot_len);
+//        memset(h_seq2, 0, tot_len2);
 #pragma omp parallel for
-        for(int i = l_id; i < r_id; i++) {
+        for (int i = l_id; i < r_id; i++) {
             memcpy(h_seq + h_pre_sum[i - l_id], records1[i].seq.c_str(), h_len[i - l_id]);
+            memcpy(h_seq2 + h_pre_sum2[i - l_id], records2[i].seq.c_str(), h_len2[i - l_id]);
         }
-        //std::cout << "host memcpy cost " << GetTime() - t0 << std::endl;
 
-        t0 = GetTime();
         cudaMemcpy(d_seq, h_seq, tot_len, cudaMemcpyHostToDevice);
         cudaMemcpy(d_len, h_len, s_len * sizeof(int), cudaMemcpyHostToDevice);
         cudaMemcpy(d_pre_sum, h_pre_sum, s_len * sizeof(int), cudaMemcpyHostToDevice);
+
+        cudaMemcpy(d_seq2, h_seq2, tot_len2, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_len2, h_len2, s_len * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_pre_sum2, h_pre_sum2, s_len * sizeof(int), cudaMemcpyHostToDevice);
+
         cudaMemcpy(d_index_para, &index_parameters, sizeof(IndexParameters), cudaMemcpyHostToDevice);
-        //std::cout << "memcpy2 execution time: " << GetTime() - t0 << " seconds, size " << tot_len + s_len * sizeof(int) << std::endl;
 
-        t0 = GetTime();
-        for(int i = 0; i < s_len; i++) h_mpools[i].pos = 0;
+        for (int i = 0; i < s_len; i++) {
+            h_mpools[i].pos = 0;
+            a_randstrobe_sizes[i] = 0;
+            a_hashes[i] = 0;
+        }
         cudaMemcpy(d_mpools, h_mpools, s_len * sizeof(my_pool), cudaMemcpyHostToDevice);
-        //std::cout << "buffer memcpy execution time: " << GetTime() - t0 << std::endl;
 
-        t0 = GetTime();
-        //std::cout << "read num " << s_len << std::endl;
-        int threads_per_block = 32;
-        int blocks_per_grid = (s_len + threads_per_block - 1) / threads_per_block;
-        //std::cout << "blocks_per_grid " << blocks_per_grid << std::endl;
-        gpu_step2<<<blocks_per_grid, threads_per_block>>>(d_randstrobes, d_randstrobe_start_indices, s_len, d_pre_sum, d_len, d_seq, d_index_para, a_randstrobe_sizes, a_hashes, d_mpools);
+        double t1 = GetTime();
+        int threads_per_block = 256;
+        int reads_per_block = threads_per_block * GPU_read_block_size;
+        int blocks_per_grid = (s_len + reads_per_block - 1) / reads_per_block;
+        gpu_step2<<<blocks_per_grid, threads_per_block>>>(index.bits, index.filter_cutoff, d_randstrobes,
+                                                          index.randstrobes.size(), d_randstrobe_start_indices,
+                                                          s_len, d_pre_sum, d_len, d_seq, d_pre_sum2, d_len2, d_seq2,
+                                                          d_index_para,
+                                                          a_randstrobe_sizes, a_hashes, d_mpools, a_global_total_hits,
+                                                          a_global_nr_good_hits);
         cudaDeviceSynchronize();
-        //std::cout << "GPU run cost " << GetTime() - t0 << std::endl;
-        gpu_cost += GetTime() - t0;
-
+        gpu_cost += GetTime() - t1;
 
         for (size_t i = 0; i < s_len; ++i) {
             size_tot += a_randstrobe_sizes[i];
+            h_global_total_hits += a_global_total_hits[i];
+            h_global_nr_good_hits += a_global_nr_good_hits[i];
         }
-        //std::cout << "size tot " << size_tot << ", avg : " << 1.0 * size_tot / s_len << std::endl;
         for (size_t i = 0; i < 1; ++i) {
             int id = rand() % s_len;
             //int id = i;
-            //std::cout << "Query " << id + l_id << ": Position " << a_randstrobe_sizes[id] << " " << a_hashes[id] <<  std::endl;
             check_sum += a_randstrobe_sizes[id];
         }
-        //std::cout << "check sum is " << check_sum << std::endl;
     }
-
-
-    for(int l_id = 0; l_id < records2.size(); l_id += batch_size) {
-
-        int r_id = l_id + batch_size;
-        if(r_id > records2.size()) r_id = records2.size();
-        int s_len = r_id - l_id;
-        //printf("[%d %d] -- %d\n", l_id, r_id, s_len);
-
-
-        uint64_t tot_len = 0;
-        h_pre_sum[0] = 0;
-        for(int i = l_id; i < r_id; i++) {
-            tot_len += records2[i].seq.length();
-            h_len[i - l_id] = records2[i].seq.length();
-            h_pre_sum[i + 1 - l_id] = h_pre_sum[i - l_id] + h_len[i - l_id];
-        }
-
-        //std::cout << "tot_len : " << tot_len << std::endl;
-        //std::cout << "pre_sum : " << h_pre_sum[s_len] << std::endl;
-
-        memset(h_seq, 0, tot_len);
-
-        t0 = GetTime();
-#pragma omp parallel for
-        for(int i = l_id; i < r_id; i++) {
-            memcpy(h_seq + h_pre_sum[i - l_id], records2[i].seq.c_str(), h_len[i - l_id]);
-        }
-        //std::cout << "host memcpy cost " << GetTime() - t0 << std::endl;
-
-        t0 = GetTime();
-        cudaMemcpy(d_seq, h_seq, tot_len, cudaMemcpyHostToDevice);
-        cudaMemcpy(d_len, h_len, s_len * sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_pre_sum, h_pre_sum, s_len * sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_index_para, &index_parameters, sizeof(IndexParameters), cudaMemcpyHostToDevice);
-        //std::cout << "memcpy2 execution time: " << GetTime() - t0 << " seconds, size " << tot_len + s_len * sizeof(int) << std::endl;
-
-        t0 = GetTime();
-        for(int i = 0; i < s_len; i++) h_mpools[i].pos = 0;
-        cudaMemcpy(d_mpools, h_mpools, s_len * sizeof(my_pool), cudaMemcpyHostToDevice);
-        //std::cout << "buffer memcpy execution time: " << GetTime() - t0 << std::endl;
-
-        t0 = GetTime();
-        //std::cout << "read num " << s_len << std::endl;
-        int threads_per_block = 32;
-        int blocks_per_grid = (s_len + threads_per_block - 1) / threads_per_block;
-        //std::cout << "blocks_per_grid " << blocks_per_grid << std::endl;
-        gpu_step2<<<blocks_per_grid, threads_per_block>>>(d_randstrobes, d_randstrobe_start_indices, s_len, d_pre_sum, d_len, d_seq, d_index_para, a_randstrobe_sizes, a_hashes, d_mpools);
-        cudaDeviceSynchronize();
-        //std::cout << "GPU run cost " << GetTime() - t0 << std::endl;
-        gpu_cost += GetTime() - t0;
-
-
-        for (size_t i = 0; i < s_len; ++i) {
-            size_tot += a_randstrobe_sizes[i];
-        }
-        //std::cout << "size tot " << size_tot << ", avg : " << 1.0 * size_tot / s_len << std::endl;
-        for (size_t i = 0; i < 1; ++i) {
-            int id = rand() % s_len;
-            //int id = i;
-            //std::cout << "Query " << id + l_id << ": Position " << a_randstrobe_sizes[id] << " " << a_hashes[id] <<  std::endl;
-            check_sum += a_randstrobe_sizes[id];
-        }
-        //std::cout << "check sum is " << check_sum << std::endl;
-    }
+    tot_cost += GetTime() - t0;
 
     std::cout << "gpu cost " << gpu_cost << std::endl;
-    std::cout << check_sum << " " << size_tot << std::endl;
+    std::cout << "total cost " << tot_cost << std::endl;
+    std::cout << "check_sum : " << check_sum << ", size_tot : " << size_tot << std::endl;
+    std::cout << "total_hits : " << h_global_total_hits << ", nr_good_hits : " << h_global_nr_good_hits << std::endl;
 
     t0 = GetTime();
     cudaFree(d_seq);
