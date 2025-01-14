@@ -121,10 +121,29 @@ struct my_pool {
     int pos;
 };
 
+struct Hit {
+    int query_start;
+    int query_end;
+    int ref_start;
+    int ref_end;
+    __host__ __device__ bool operator<(const Hit& other) const {
+        if(query_start == other.query_start) return ref_start < other.ref_start;
+        return query_start < other.query_start;
+    }
+
+    __host__ __device__  bool operator==(const Hit& other) const {
+        return query_start == other.query_start &&
+               query_end == other.query_end &&
+               ref_start == other.ref_start &&
+               ref_end == other.ref_end;
+    }
+};
+
+
 #define use_my_pool
 
-#define vec_pre_block_size (1ll << 14)
-#define vec_block_size (1ll << 16)
+#define vec_pre_block_size (1ll << 15)
+#define vec_block_size (1ll << 19)
 
 #ifdef use_my_pool
 template <typename T>
@@ -134,15 +153,17 @@ struct my_vector {
     int capacity;
     my_pool *mpool;
 
-    __device__ my_vector(my_pool* mpool_) {
+    __device__ my_vector() : data(nullptr), length(0), capacity(0), mpool(nullptr) {}
+
+    __device__ my_vector(my_pool* mpool_, int cap_ = vec_pre_block_size) {
         mpool = mpool_;
-        data = (T*) (mpool->data + mpool->pos * vec_pre_block_size);
+        data = (T*) (mpool->data + mpool->pos * cap_);
         mpool->pos++;
-        if(mpool->pos * vec_pre_block_size >= vec_block_size) {
+        if(mpool->pos * cap_ >= vec_block_size) {
             printf("mpool->pos is %d, OOM\n", mpool->pos);
         }
         length = 0;
-        capacity = vec_pre_block_size / sizeof(T);
+        capacity = cap_ / sizeof(T);
     }
 
     __device__ ~my_vector() {
@@ -269,5 +290,32 @@ __device__ void my_swap(T& a, T& b) {
     a = b;
     b = temp;
 }
+
+template <typename T>
+__device__ T my_max(T a, T b) {
+    return a > b ? a : b;
+}
+
+template <typename T>
+__device__ T my_min(T a, T b) {
+    return a < b ? a : b;
+}
+
+template <typename T1, typename T2>
+struct my_pair {
+    T1 first;
+    T2 second;
+
+    __device__ my_pair() : first(T1()), second(T2()) {}
+    __device__ my_pair(const T1& a, const T2& b) : first(a), second(b) {}
+
+    __device__ bool operator<(const my_pair& other) const {
+        if (first < other.first) return true;
+        if (first > other.first) return false;
+        return second < other.second;
+    }
+};
+
+
 #endif // MY_STRUCT_HPP
 

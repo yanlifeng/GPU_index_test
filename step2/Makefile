@@ -1,7 +1,7 @@
 # Compiler and flags
 CXX = nvcc
 NVCC = nvcc
-CXXFLAGS = -std=c++17 -O3 -w -I./
+CXXFLAGS  = -std=c++17 -O3 -w -I./
 NVCCFLAGS = -std=c++17 -O3 -w -I./
 
 

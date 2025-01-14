@@ -30,6 +30,10 @@
 #include "readlen.hpp"
 #include "my_struct.hpp"
 
+#include <thrust/sort.h>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+
 #define my_bucket_index_t StrobemerIndex::bucket_index_t
 
 inline double GetTime() {
@@ -114,6 +118,215 @@ __device__ size_t gpu_find(
     return static_cast<size_t>(-1); // No match
 }
 
+template <typename T>
+__device__ void bubble_sort(T* data, int size) {
+    for (int i = 0; i < size - 1; ++i) {
+        for (int j = 0; j < size - i - 1; ++j) {
+            if (data[j + 1] < data[j]) {
+                T temp = data[j];
+                data[j] = data[j + 1];
+                data[j + 1] = temp;
+            }
+        }
+    }
+}
+
+__device__ void merge_hits_into_nams(
+        my_vector<my_pair<int, Hit>>& hits_per_ref,
+        int k,
+        bool sort,
+        bool is_revcomp,
+        my_vector<Nam>& nams,
+        my_pool& mpool
+) {
+
+    if(hits_per_ref.size() == 0) return;
+
+//    printf("hits struct num %d\n", hits_per_ref.size());
+
+//    for(int i = 0; i < hits_per_ref.size(); i++) {
+//        Hit h = hits_per_ref[i].second;
+//        printf("ref %d, hit %d %d %d %d\n", hits_per_ref[i].first, h.query_start, h.query_end, h.ref_start, h.ref_end);
+//    }
+//    printf("\n");
+
+//    bubble_sort(&(hits_per_ref[0]), hits_per_ref.size());
+
+//    for(int i = 0; i < hits_per_ref.size(); i++) {
+//        printf("ref %d, hit %d\n", hits_per_ref[i].first, hits_per_ref[i].second.query_start);
+//    }
+//    printf("\n");
+
+    int ref_num = 0;
+    my_vector<int> each_ref_size(&mpool);
+    int pre_ref_id = hits_per_ref[0].first;;
+    int now_ref_num = 1;
+    for(int i = 1; i < hits_per_ref.size(); i++) {
+        int ref_id = hits_per_ref[i].first;
+        Hit hit = hits_per_ref[i].second;
+        if(ref_id != pre_ref_id) {
+            ref_num++;
+            pre_ref_id = ref_id;
+            each_ref_size.push_back(now_ref_num);
+            now_ref_num = 1;
+        } else {
+            now_ref_num++;
+        }
+    }
+    ref_num++;
+    each_ref_size.push_back(now_ref_num);
+//    printf("ref_num is %d\n", ref_num);
+
+
+    my_vector<Nam> open_nams(&mpool);
+    int now_vec_pos = 0;
+    for (int i = 0; i < ref_num; i++) {
+        if(i != 0) now_vec_pos += each_ref_size[i - 1];
+        int ref_id = hits_per_ref[now_vec_pos].first;
+//        printf("ref id %d has %d hits\n", ref_id, each_ref_size[i]);
+
+        if (sort) {
+            //TODO
+//            std::sort(hits.begin(), hits.end());
+        }
+
+        open_nams.clear();
+        unsigned int prev_q_start = 0;
+        for (int j = 0; j < each_ref_size[i]; j++) {
+            Hit& h = hits_per_ref[now_vec_pos + j].second;
+            bool is_added = false;
+
+            for (int k = 0; k < open_nams.size(); k++) {
+                Nam& o = open_nams[k];
+
+                // Extend NAM
+                if ((o.query_prev_hit_startpos < h.query_start) && (h.query_start <= o.query_end ) && (o.ref_prev_hit_startpos < h.ref_start) && (h.ref_start <= o.ref_end) ){
+                    if ( (h.query_end > o.query_end) && (h.ref_end > o.ref_end) ) {
+                        o.query_end = h.query_end;
+                        o.ref_end = h.ref_end;
+                        //                        o.previous_query_start = h.query_s;
+                        //                        o.previous_ref_start = h.ref_s; // keeping track so that we don't . Can be caused by interleaved repeats.
+                        o.query_prev_hit_startpos = h.query_start;
+                        o.ref_prev_hit_startpos = h.ref_start;
+                        o.n_hits ++;
+                        //                        o.score += (float)1/ (float)h.count;
+                        is_added = true;
+                        break;
+                    }
+                    else if ((h.query_end <= o.query_end) && (h.ref_end <= o.ref_end)) {
+                        //                        o.previous_query_start = h.query_s;
+                        //                        o.previous_ref_start = h.ref_s; // keeping track so that we don't . Can be caused by interleaved repeats.
+                        o.query_prev_hit_startpos = h.query_start;
+                        o.ref_prev_hit_startpos = h.ref_start;
+                        o.n_hits ++;
+                        //                        o.score += (float)1/ (float)h.count;
+                        is_added = true;
+                        break;
+                    }
+                }
+
+            }
+
+            // Add the hit to open matches
+            if (!is_added){
+                Nam n;
+                n.query_start = h.query_start;
+                n.query_end = h.query_end;
+                n.ref_start = h.ref_start;
+                n.ref_end = h.ref_end;
+                n.ref_id = ref_id;
+                //                n.previous_query_start = h.query_s;
+                //                n.previous_ref_start = h.ref_s;
+                n.query_prev_hit_startpos = h.query_start;
+                n.ref_prev_hit_startpos = h.ref_start;
+                n.n_hits = 1;
+                n.is_rc = is_revcomp;
+                //                n.score += (float)1 / (float)h.count;
+                open_nams.push_back(n);
+            }
+
+            // Only filter if we have advanced at least k nucleotides
+            if (h.query_start > prev_q_start + k) {
+
+                // Output all NAMs from open_matches to final_nams that the current hit have passed
+                for (int k = 0; k < open_nams.size(); k++) {
+                    Nam& n = open_nams[k];
+                    if (n.query_end < h.query_start) {
+                        int n_max_span = my_max(n.query_span(), n.ref_span());
+                        int n_min_span = my_min(n.query_span(), n.ref_span());
+                        float n_score;
+                        n_score = ( 2*n_min_span -  n_max_span) > 0 ? (float) (n.n_hits * ( 2*n_min_span -  n_max_span) ) : 1;   // this is really just n_hits * ( min_span - (offset_in_span) ) );
+                        //                        n_score = n.n_hits * n.query_span();
+                        n.score = n_score;
+                        n.nam_id = nams.size();
+                        nams.push_back(n);
+                    }
+                }
+
+                // Remove all NAMs from open_matches that the current hit have passed
+                auto c = h.query_start;
+                int old_open_size = open_nams.size();
+                open_nams.clear();
+                for (int in = 0; in < old_open_size; ++in) {
+                    if (!(open_nams[in].query_end < c)) {
+                        open_nams.push_back(open_nams[in]);
+                    }
+                }
+                prev_q_start = h.query_start;
+            }
+        }
+
+        // Add all current open_matches to final NAMs
+        for (int k = 0; k < open_nams.size(); k++) {
+            Nam& n = open_nams[k];
+            int n_max_span = my_max(n.query_span(), n.ref_span());
+            int n_min_span = my_min(n.query_span(), n.ref_span());
+            float n_score;
+            n_score = ( 2*n_min_span -  n_max_span) > 0 ? (float) (n.n_hits * ( 2*n_min_span -  n_max_span) ) : 1;   // this is really just n_hits * ( min_span - (offset_in_span) ) );
+            //            n_score = n.n_hits * n.query_span();
+            n.score = n_score;
+            n.nam_id = nams.size();
+            nams.push_back(n);
+        }
+    }
+}
+
+__device__ void merge_hits_into_nams_forward_and_reverse(
+        my_vector<Nam>& nams,
+        my_vector<my_pair<int, Hit>> hits_per_ref[2],
+        int k,
+        bool sort,
+        my_pool& mpool
+) {
+    for (size_t is_revcomp = 0; is_revcomp < 2; ++is_revcomp) {
+        auto& hits_oriented = hits_per_ref[is_revcomp];
+        merge_hits_into_nams(hits_oriented, k, sort, is_revcomp, nams, mpool);
+    }
+}
+
+
+__device__ void add_to_hits_per_ref(
+        my_vector<my_pair<int, Hit>>& hits_per_ref,
+        int query_start,
+        int query_end,
+        size_t position,
+        const RefRandstrobe *d_randstrobes,
+        size_t d_randstrobes_size,
+        int k
+) {
+    int min_diff = 1 << 30;
+    //printf("pos %llu, [%d %d]\n", position, query_start, query_end);
+    for (const auto hash = gpu_get_hash(d_randstrobes, d_randstrobes_size, position); gpu_get_hash(d_randstrobes, d_randstrobes_size, position) == hash; ++position) {
+        int ref_start = d_randstrobes[position].position;
+        int ref_end = ref_start + d_randstrobes[position].strobe2_offset() + k;
+        int diff = std::abs((query_end - query_start) - (ref_end - ref_start));
+        if (diff <= min_diff) {
+            hits_per_ref.push_back({d_randstrobes[position].reference_index(), Hit{query_start, query_end, ref_start, ref_end}});
+            min_diff = diff;
+        }
+    }
+}
+
 __device__ int lock = 0;
 
 __device__ void acquire_lock() {
@@ -148,6 +361,8 @@ __global__ void gpu_step2(
         uint64_t *global_nr_good_hits
 ) {
     int b_tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+//    if(b_tid) return;
 
     int l_range = b_tid * GPU_read_block_size;
     int r_range = l_range + GPU_read_block_size;
@@ -297,42 +512,65 @@ __global__ void gpu_step2(
 #ifdef use_my_time
             t_start = clock64();
 #endif
-//        __shared__ uint64_t shared_total_hits;
-//        __shared__ uint64_t shared_nr_good_hits;
-//        if (threadIdx.x == 0) {
-//            shared_total_hits = 0;
-//            shared_nr_good_hits = 0;
-//        }
-//        __syncthreads();
+            my_vector<my_pair<int, Hit>> hits_per_ref[2];
+            hits_per_ref[0] = my_vector<my_pair<int, Hit>>(&mpool);
+            hits_per_ref[1] = my_vector<my_pair<int, Hit>>(&mpool);
+
             uint64_t local_total_hits = 0;
             uint64_t local_nr_good_hits = 0;
+            // total element in hits_per_ref is less than 500 (pair is 6K bytes), get a vector<pair<int, uint64_t>> to store them
             for (int i = 0; i < randstrobes.size(); i++) {
                 QueryRandstrobe q = randstrobes[i];
                 size_t position = gpu_find(d_randstrobes, d_randstrobe_start_indices, q.hash, bits);
+//                printf("poss %llu\n", position);
                 if (position != static_cast<size_t>(-1)) {
-//                atomicAdd((unsigned long long int*)&shared_total_hits, 1ULL);
                     local_total_hits++;
                     bool res = gpu_is_filtered(d_randstrobes, d_randstrobes_size, position, filter_cutoff);
                     if (res) {
                         continue;
                     }
                     local_nr_good_hits++;
-//                atomicAdd((unsigned long long int*)&shared_nr_good_hits, 1ULL);
                     // TODO
-//                add_to_hits_per_ref(hits_per_ref[q.is_reverse], q.start, q.end, index, position);
+                    add_to_hits_per_ref(hits_per_ref[q.is_reverse], q.start, q.end, position, d_randstrobes, d_randstrobes_size, index_para->syncmer.k);
                 }
             }
+
+
+            my_vector<Nam> nams(&mpool);
+
+            float nonrepetitive_fraction = local_total_hits > 0 ? ((float) local_nr_good_hits) / ((float) local_total_hits) : 1.0;
+            merge_hits_into_nams_forward_and_reverse(nams, hits_per_ref, index_para->syncmer.k, false, mpool);
+//            printf("float %f\n", nonrepetitive_fraction);
+
+//            bubble_sort((Nam*)&(nams[0]), nams.size());
+            for(int i = 0; i < nams.size(); i++) {
+                local_total_hits += nams[i].ref_id + nams[i].ref_start + nams[i].ref_end;
+                local_nr_good_hits += nams[i].score + nams[i].query_start + nams[i].query_end;
+            }
+
             global_total_hits[tid] = local_total_hits;
             global_nr_good_hits[tid] = local_nr_good_hits;
+
+            if(0) {
+                printf("total_hits %llu, nr_good_hits %llu, nonrepetitive_fraction %.3f, nam size %d\n", local_total_hits, local_nr_good_hits, nonrepetitive_fraction, nams.size());
+                for(int i = 0; i < nams.size(); i++) {
+                    printf("query_start: %d, query_end: %d, query_prev_hit_startpos: %d, ref_start: %d, ref_end: %d, ref_prev_hit_startpos: %d, n_hits: %d, ref_id: %d, score: %.2f\n",
+//                           nams[i].nam_id,
+                           nams[i].query_start,
+                           nams[i].query_end,
+                           nams[i].query_prev_hit_startpos,
+                           nams[i].ref_start,
+                           nams[i].ref_end,
+                           nams[i].ref_prev_hit_startpos,
+                           nams[i].n_hits,
+                           nams[i].ref_id,
+                           nams[i].score);
+                }
+                printf("\n\n");
+            }
 #ifdef use_my_time
             t_time3 += clock64() - t_start;
 #endif
-
-//            __syncthreads();
-//            if (threadIdx.x == 0) {
-//                atomicAdd((unsigned long long int *) global_total_hits, shared_total_hits);
-//                atomicAdd((unsigned long long int *) global_nr_good_hits, shared_nr_good_hits);
-//            }
         }
     }
 
@@ -462,7 +700,7 @@ int main(int argc, char **argv) {
               << index.randstrobes.size() * sizeof(RefRandstrobe) +
                  index.randstrobe_start_indices.size() * sizeof(my_bucket_index_t) << std::endl;
 
-#define batch_size 25000
+#define batch_size 10000
 #define batch_seq_szie batch_size * 250ll
 
     t0 = GetTime();

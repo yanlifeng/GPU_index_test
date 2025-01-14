@@ -5,25 +5,10 @@
 #include <map>
 #include <queue>
 
+#include "my_struct.hpp"
+
 namespace {
 
-struct Hit {
-    int query_start;
-    int query_end;
-    int ref_start;
-    int ref_end;
-    bool operator<(const Hit& other) const {
-        if(query_start == other.query_start) return ref_start < other.ref_start;
-        return query_start < other.query_start;
-    }
-
-    bool operator==(const Hit& other) const {
-        return query_start == other.query_start &&
-                query_end == other.query_end &&
-                ref_start == other.ref_start &&
-                ref_end == other.ref_end;
-    }
-};
 
 inline void add_to_hits_per_ref_fast(
     robin_hood::unordered_map<unsigned int, std::vector<Hit>>& hits_per_ref,

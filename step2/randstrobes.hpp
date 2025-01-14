@@ -79,11 +79,11 @@ struct RefRandstrobe {
         return hash < other.hash;
     }
 
-    int reference_index() const {
+    __host__ __device__ int reference_index() const {
         return m_packed >> bit_alloc;
     }
 
-    int strobe2_offset() const {
+    __host__ __device__ int strobe2_offset() const {
         return m_packed & mask;
     }
 

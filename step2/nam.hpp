@@ -23,17 +23,26 @@ struct Nam {
 //    unsigned int previous_ref_start;
     bool is_rc = false;
 
-    int ref_span() const {
+    __host__ __device__ int ref_span() const {
         return ref_end - ref_start;
     }
 
-    int query_span() const {
+    __host__ __device__ int query_span() const {
         return query_end - query_start;
     }
 
-    bool operator < (const Nam& nn) const {
+    // TODO where use this <
+//    bool operator < (const Nam& nn) const {
+//        if(query_end != nn.query_end) return query_end < nn.query_end;
+//        return nam_id < nn.nam_id;
+//    }
+
+    __host__ __device__ bool operator < (const Nam& nn) const {
+        if(score != nn.score) return score > nn.score;
         if(query_end != nn.query_end) return query_end < nn.query_end;
-        return nam_id < nn.nam_id;
+        if(query_start != nn.query_start) return query_start < nn.query_start;
+        if(ref_end != nn.ref_end) return ref_end < nn.ref_end;
+        if(ref_start != nn.ref_start) return ref_start < nn.ref_start;
     }
 };
 
