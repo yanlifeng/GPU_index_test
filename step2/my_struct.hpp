@@ -5,120 +5,16 @@
 #include <stdexcept>
 #include <cuda_runtime.h>
 
-// Device deque implementation using CUDA memory management (cudaMalloc and cudaFree)
-template <typename T>
-struct my_deque {
-    T* data;          // Pointer to device memory holding the deque data
-    size_t capacity;  // Capacity of the deque
-    size_t size;      // Current number of elements in the deque
-    size_t front_idx; // Front index of the deque (used for pop_front)
-    size_t back_idx;  // Back index of the deque (used for push_back)
-
-    // Constructor: Initialize the deque with zero capacity and size
-    __device__ my_deque() : data(nullptr), capacity(0), size(0), front_idx(0), back_idx(0) {}
-
-    // Destructor: Free the allocated device memory
-    __device__ ~my_deque() {
-        if (data != nullptr) {
-            free(data);
-            //cudaFree(data);
-        }
-    }
-
-    // Resize the deque's internal memory if needed
-    __device__ void resize(size_t new_capacity) {
-        T* new_data;
-        // Allocate new memory on device
-        //cudaMalloc((void**)&new_data, new_capacity * sizeof(T));
-        new_data = (T*)malloc(new_capacity * sizeof(T));
-        if (new_data == nullptr) {
-//            throw std::bad_alloc();
-            printf("new_capacity * sizeof(T) %d, std::bad_alloc()\n", new_capacity * sizeof(T));
-        }
-
-        // Copy old elements to new memory (circular copy)
-        for (size_t i = 0; i < size; ++i) {
-            size_t index = (front_idx + i) % capacity;
-//            cudaMemcpy(&new_data[i], &data[index], sizeof(T), cudaMemcpyDeviceToDevice);
-//            memcpy(&new_data[i], &data[index], sizeof(T));
-            new_data[i] = data[index];
-        }
-
-        // Free the old memory and update the pointers
-        free(data);
-        //cudaFree(data);
-        data = new_data;
-        capacity = new_capacity;
-        front_idx = 0;
-        back_idx = size;
-    }
-
-    // Push an element to the back of the deque
-    __device__ void push_back(const T& value) {
-        if (size == capacity) {
-            resize(capacity == 0 ? 1 : capacity * 2); // Double the capacity if full
-        }
-
-        // Store the value at the back index
-//        cudaMemcpy(&data[back_idx], &value, sizeof(T), cudaMemcpyHostToDevice);
-        data[back_idx] = value;
-
-        // Update the back index and size
-        back_idx = (back_idx + 1) % capacity;
-        size++;
-    }
-
-    // Pop an element from the front of the deque
-    __device__ void pop_front() {
-        if (size == 0) {
-//            throw std::underflow_error("Deque is empty");
-            printf("Deque is empty\n");
-        }
-
-        // Move the front index and decrease the size
-        front_idx = (front_idx + 1) % capacity;
-        size--;
-    }
-
-    // Get the size (number of elements) of the deque
-    __device__ size_t get_size() const {
-        return size;
-    }
-
-    // Clear the deque
-    __device__ void clear() {
-        size = 0;
-        front_idx = 0;
-        back_idx = 0;
-    }
-
-    // Access an element at the given index (with bounds checking)
-    __device__ T& operator[](size_t index) {
-        if (index >= size) {
-//            throw std::out_of_range("Index out of bounds");
-            printf("Index out of bounds\n");
-        }
-
-        size_t real_index = (front_idx + index) % capacity;
-        return data[real_index];
-    }
-
-    // Const version of the operator[]
-    __device__ const T& operator[](size_t index) const {
-        if (index >= size) {
-//            throw std::out_of_range("Index out of bounds");
-            printf("Index out of bounds\n");
-        }
-
-        size_t real_index = (front_idx + index) % capacity;
-        return data[real_index];
-    }
-};
+#define vec_block_num_shift 3
+#define vec_block_size_shift 16
+#define vec_pre_block_size (1ll << vec_block_size_shift)
+#define vec_block_size (1ll << (vec_block_size_shift + vec_block_num_shift))
 
 struct my_pool {
     void* data;
     int size;
     int pos;
+    int used[1 << vec_block_num_shift];
 };
 
 struct Hit {
@@ -139,11 +35,20 @@ struct Hit {
     }
 };
 
+struct RescueHit {
+    size_t position;
+    unsigned int count;
+    unsigned int query_start;
+    unsigned int query_end;
+    __host__ __device__ bool operator<(const RescueHit& other) const {
+        if (count != other.count) return count < other.count;
+        if (query_start != other.query_start) return query_start < other.query_start;
+        return query_end < other.query_end;
+    }
+};
+
 
 #define use_my_pool
-
-#define vec_pre_block_size (1ll << 15)
-#define vec_block_size (1ll << 19)
 
 #ifdef use_my_pool
 template <typename T>
@@ -152,27 +57,50 @@ struct my_vector {
     int length;
     int capacity;
     my_pool *mpool;
+    int free_pos;
 
-    __device__ my_vector() : data(nullptr), length(0), capacity(0), mpool(nullptr) {}
+    __device__ my_vector() : data(nullptr), length(0), capacity(0), mpool(nullptr), free_pos(-1) {
+        //printf("null vec %d\n", free_pos);
+    }
 
     __device__ my_vector(my_pool* mpool_, int cap_ = vec_pre_block_size) {
         mpool = mpool_;
-        data = (T*) (mpool->data + mpool->pos * cap_);
-        mpool->pos++;
-        if(mpool->pos * cap_ >= vec_block_size) {
-            printf("mpool->pos is %d, OOM\n", mpool->pos);
+        free_pos = -1;
+        for(int i = 0; i < (1 << vec_block_num_shift); i++) {
+            if(mpool->used[i] == 0) {
+                free_pos = i;
+                mpool->used[i] = 1;
+                break;
+            }
         }
+        data = (T*) (mpool->data + free_pos * cap_);
         length = 0;
         capacity = cap_ / sizeof(T);
+        if(free_pos == -1) printf("mpool OOM\n");
+        //else printf("get pos %d, ptr %p, size %d\n", free_pos, data, capacity);
     }
 
     __device__ ~my_vector() {
+        //if(free_pos != -1) {
+        //    mpool->used[free_pos] = 0;
+        //    printf("free1 pos %d\n", free_pos);
+        //}
+        //free_pos = -1;
+    }
+
+    __device__ void release() {
+        if(free_pos != -1) {
+            mpool->used[free_pos] = 0;
+            //printf("free2 pos %d\n", free_pos);
+        }
+        free_pos = -1;
     }
 
     __device__ void push_back(const T& value) {
         data[length++] = value;
         if(length >= capacity) {
-            printf("OOM %d %d\n", length, capacity);
+            printf("OOM %d %d, T %d\n", length, capacity, sizeof(T));
+//            exit(0);
         }
     }
 

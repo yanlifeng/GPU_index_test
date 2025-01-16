@@ -912,13 +912,7 @@ std::pair<float, std::vector<Nam>> find_nams(
  * than filter_cutoff.
  *
  */
-struct RescueHit {
-    size_t position;
-    unsigned int count;
-    unsigned int query_start;
-    unsigned int query_end;
 
-};
 
 bool cmp1 (const RescueHit& a, const RescueHit& b) {
     return std::tie(a.count, a.query_start, a.query_end)
