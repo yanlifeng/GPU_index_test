@@ -70,9 +70,9 @@ struct RefRandstrobe {
     RefRandstrobe() { }
 
     RefRandstrobe(randstrobe_hash_t hash, uint32_t position, uint32_t packed)
-        : hash(hash)
-        , position(position)
-        , m_packed(packed) { }
+            : hash(hash)
+            , position(position)
+            , m_packed(packed) { }
 
     bool operator< (const RefRandstrobe& other) const {
         if(hash == other.hash) return position < other.position;
@@ -136,13 +136,13 @@ struct Syncmer {
 class RandstrobeIterator {
 public:
     RandstrobeIterator(
-        const std::vector<Syncmer>* syncmers,
-        RandstrobeParameters parameters
+            const std::vector<Syncmer>* syncmers,
+            RandstrobeParameters parameters
     ) : syncmers(syncmers)
-      , w_min(parameters.w_min)
-      , w_max(parameters.w_max)
-      , q(parameters.q)
-      , max_dist(parameters.max_dist)
+            , w_min(parameters.w_min)
+            , w_max(parameters.w_max)
+            , q(parameters.q)
+            , max_dist(parameters.max_dist)
     {
         if (w_min > w_max) {
             throw std::invalid_argument("w_min is greater than w_max");
@@ -168,34 +168,34 @@ public:
     {
         if (w_min > w_max) {
             printf("w_min is greater than w_max\n");
-			//            throw std::invalid_argument("w_min is greater than w_max");
-		}
-	}
+            //            throw std::invalid_argument("w_min is greater than w_max");
+        }
+    }
 
-	__device__ Randstrobe gpu_get(unsigned int strobe1_index) const {
-		unsigned int w_end = (strobe1_index + w_max < (*gpu_syncmers).size() - 1) ? (strobe1_index + w_max) : (*gpu_syncmers).size() - 1;
+    __device__ Randstrobe gpu_get(unsigned int strobe1_index) const {
+        unsigned int w_end = (strobe1_index + w_max < (*gpu_syncmers).size() - 1) ? (strobe1_index + w_max) : (*gpu_syncmers).size() - 1;
 
-		auto strobe1 = (*gpu_syncmers)[strobe1_index];
-		auto max_position = strobe1.position + max_dist;
-		unsigned int w_start = strobe1_index + w_min;
+        auto strobe1 = (*gpu_syncmers)[strobe1_index];
+        auto max_position = strobe1.position + max_dist;
+        unsigned int w_start = strobe1_index + w_min;
 
-		uint64_t min_val = 0xFFFFFFFFFFFFFFFF;
+        uint64_t min_val = 0xFFFFFFFFFFFFFFFF;
 
-		Syncmer strobe2 = strobe1;
+        Syncmer strobe2 = strobe1;
 
-		for (auto i = w_start; i <= w_end && (*gpu_syncmers)[i].position <= max_position; i++) {
-			uint64_t hash_diff = (strobe1.hash ^ (*gpu_syncmers)[i].hash) & q;
-			uint64_t res = 0;
+        for (auto i = w_start; i <= w_end && (*gpu_syncmers)[i].position <= max_position; i++) {
+            uint64_t hash_diff = (strobe1.hash ^ (*gpu_syncmers)[i].hash) & q;
+            uint64_t res = 0;
 
-			for (int j = 0; j < 64; j++) {
-				res += ((hash_diff >> j) & 1);
-			}
+            for (int j = 0; j < 64; j++) {
+                res += ((hash_diff >> j) & 1);
+            }
 
-			if (res < min_val) {
-				min_val = res;
-				strobe2 = (*gpu_syncmers)[i];
-			}
-		}
+            if (res < min_val) {
+                min_val = res;
+                strobe2 = (*gpu_syncmers)[i];
+            }
+        }
         //Randstrobe r;
         //r.hash = randstrobe_hash(strobe1.hash, strobe2.hash);
         //r.strobe1_pos = static_cast<uint32_t>(strobe1.position);
@@ -203,8 +203,8 @@ public:
         //printf("strobe1.position %u %lld %u\n", static_cast<uint32_t>(strobe1.position), strobe1.position, r.strobe1_pos);
         //return r;
 
-		return Randstrobe{randstrobe_hash(strobe1.hash, strobe2.hash), static_cast<uint32_t>(strobe1.position), static_cast<uint32_t>(strobe2.position)};
-	}
+        return Randstrobe{randstrobe_hash(strobe1.hash, strobe2.hash), static_cast<uint32_t>(strobe1.position), static_cast<uint32_t>(strobe2.position)};
+    }
 
 
 
@@ -239,21 +239,21 @@ std::ostream& operator<<(std::ostream& os, const Syncmer& syncmer);
 class SyncmerIterator {
 public:
     SyncmerIterator(const std::string_view* seq, SyncmerParameters parameters)
-        : seq(seq), k(parameters.k), s(parameters.s), t(parameters.t_syncmer) { }
+            : seq(seq), k(parameters.k), s(parameters.s), t(parameters.t_syncmer) { }
 
     Syncmer next();
 
     __device__ SyncmerIterator(my_vector<uint64_t>* vec, const char* gpu_seq, const size_t gpu_seq_len, SyncmerParameters parameters)
-        : gpu_seq(gpu_seq), gpu_seq_len(gpu_seq_len), k(parameters.k), s(parameters.s), t(parameters.t_syncmer) {
+            : gpu_seq(gpu_seq), gpu_seq_len(gpu_seq_len), k(parameters.k), s(parameters.s), t(parameters.t_syncmer) {
         gpu_qs = vec;
         gpu_qs_front_pos = 0;
-		}
-	__device__ ~SyncmerIterator() {
+    }
+    __device__ ~SyncmerIterator() {
 //		if (gpu_qs != nullptr) {
 //			free(gpu_qs);
 //			gpu_qs = nullptr;
 //		}
-	}
+    }
 
 //    __device__ Syncmer gpu_next();
     __device__ Syncmer gpu_next() {
@@ -490,4 +490,3 @@ private:
 //std::vector<Syncmer> canonical_syncmers(const std::string_view seq, SyncmerParameters parameters);
 
 #endif
-

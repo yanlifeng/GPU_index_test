@@ -42,10 +42,10 @@ enum comp_start{
 
 // Generic enum for ture/false. Using this instead of bool to generalize templates out of Int values for secondBest. 
 // Can be usd more generically, for example for WITH_/WITHOUT_START.
-enum Bool{
-	FALSE,
-	TRUE
-};
+//enum Bool{
+//	FALSE,
+//	TRUE
+//};
 
 enum data_source{
 	NONE,

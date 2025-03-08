@@ -103,19 +103,61 @@ __device__ int gpu_get_count(
         const my_bucket_index_t *d_randstrobe_start_indices,
         my_bucket_index_t position,
         int bits
-
-)  {
+) {
     const auto key = d_randstrobes[position].hash;
     const unsigned int top_N = key >> (64 - bits);
-    my_bucket_index_t position_end = d_randstrobe_start_indices[top_N + 1];
-    int count = 1;
-    for (my_bucket_index_t position_start = position + 1; position_start < position_end; ++position_start) {
-        if (d_randstrobes[position_start].hash == key){
-            count += 1;
-        } else break;
+    int64_t position_end = d_randstrobe_start_indices[top_N + 1];
+    int64_t position_start = position;
+
+    if(position_end == 0) return 0;
+    int64_t low = position_start, high = position_end - 1, ans = 0;
+    while (low <= high) {
+        int64_t mid = (low + high) / 2;
+        if (d_randstrobes[mid].hash == key) {
+            low = mid + 1;
+            ans = mid;
+        } else {
+            high = mid - 1;
+        }
     }
-    return count;
+    // int count = 0;
+    // for (auto i = position_start; i < position_end; ++i) {
+    //     if (d_randstrobes[i].hash == key){
+    //         count += 1;
+    //     } else break;
+    // }
+    // if(count != ans - position_start + 1) {
+    //     // print d_randstrobes[position_start - position_end]
+    //     // for(int i = position_start; i < position_end; i++) {
+    //     //     printf("hash %llu ", d_randstrobes[i].hash);
+    //     // }
+    //     // printf("\n");
+    //     printf("count %d %llu\n", count, ans - position_start + 1);
+    // }
+
+    return ans - position_start + 1;
 }
+
+// __device__ int gpu_get_count(
+//         const RefRandstrobe *d_randstrobes,
+//         const my_bucket_index_t *d_randstrobe_start_indices,
+//         my_bucket_index_t position,
+//         int bits
+
+// )  {
+//     const auto key = d_randstrobes[position].hash;
+//     const unsigned int top_N = key >> (64 - bits);
+//     my_bucket_index_t position_end = d_randstrobe_start_indices[top_N + 1];
+//     // change the following for-loop to binary search
+
+//     int count = 1;
+//     for (my_bucket_index_t position_start = position + 1; position_start < position_end; ++position_start) {
+//         if (d_randstrobes[position_start].hash == key){
+//             count += 1;
+//         } else break;
+//     }
+//     return count;
+// }
 
 __device__ size_t gpu_find(
         const RefRandstrobe *d_randstrobes,
@@ -172,10 +214,11 @@ __device__ void dfs_quick_sort(T* data, int low, int high) {
 
 
 template <typename T>
-__device__ void quick_sort_iterative(T* data, int low, int high, my_pool& mpool) {
-//    int stack[32];
-    my_vector<int>stack_vec(&mpool);
-    int* stack = &(stack_vec[0]);
+__device__ void quick_sort_iterative(T* data, int low, int high, MemoryManagerType* mm) {
+    int vec_size = high - low + 1;
+//    int stack[128];
+    my_vector<int>stack_vec(mm, vec_size * 2);
+    int* stack = stack_vec.data;
     int top = -1;
 
     stack[++top] = low;
@@ -216,15 +259,14 @@ __device__ void quick_sort_iterative(T* data, int low, int high, my_pool& mpool)
         }
 
         mx_top = my_max(mx_top, top);
+        if(mx_top >= vec_size) {
+            printf("GG top size %d\n", mx_top);
+            assert(false);
+        }
+
     }
 
-    stack_vec.release();
-    //if(mx_top >= 32) printf("GG top size %d\n", mx_top);
-}
-
-template <typename T>
-__device__ void quick_sort(T* data, int size, my_pool& mpool) {
-    quick_sort_iterative(data, 0, size - 1, mpool);
+//    stack_vec.release();
 }
 
 template <typename T>
@@ -240,6 +282,22 @@ __device__ void bubble_sort(T* data, int size) {
     }
 }
 
+template <typename T>
+__device__ void quick_sort(T* data, int size, MemoryManagerType* mm) {
+//    quick_sort_iterative(data, 0, size - 1, mm);
+    bubble_sort(data, size);
+
+}
+
+
+
+struct Rescue_Seeds {
+    int read_id;
+    int read_fr;
+    int seeds_num;
+    QueryRandstrobe* seeds;
+};
+
 //#define use_my_time
 
 __device__ void merge_hits_into_nams(
@@ -248,7 +306,7 @@ __device__ void merge_hits_into_nams(
         bool sort,
         bool is_revcomp,
         my_vector<Nam>& nams,
-        my_pool& mpool,
+        MemoryManagerType* mm,
         unsigned long long &t1,
         unsigned long long &t2,
         unsigned long long &t3,
@@ -274,7 +332,7 @@ __device__ void merge_hits_into_nams(
 #ifdef use_my_time
     t_start = clock64();
 #endif
-    quick_sort(&(hits_per_ref[0]), hits_per_ref.size(), mpool);
+    quick_sort(&(hits_per_ref[0]), hits_per_ref.size(), mm);
     //bubble_sort(&(hits_per_ref[0]), hits_per_ref.size());
 #ifdef use_my_time
     t1 += clock64() - t_start;
@@ -289,7 +347,7 @@ __device__ void merge_hits_into_nams(
     t_start = clock64();
 #endif
     int ref_num = 0;
-    my_vector<int> each_ref_size(&mpool);
+    my_vector<int> each_ref_size(mm);
     int pre_ref_id = hits_per_ref[0].first;;
     int now_ref_num = 1;
     for(int i = 1; i < hits_per_ref.size(); i++) {
@@ -312,7 +370,7 @@ __device__ void merge_hits_into_nams(
 #endif
 
 
-    my_vector<Nam> open_nams(&mpool);
+    my_vector<Nam> open_nams(mm);
 
 #ifdef use_my_time
     t_start = clock64();
@@ -328,7 +386,7 @@ __device__ void merge_hits_into_nams(
         int ref_id = hits_per_ref[now_vec_pos].first;
         if (sort) {
 //            std::sort(hits.begin(), hits.end());
-//            quick_sort(&(hits_per_ref[now_vec_pos]), each_ref_size[i], mpool);
+//            quick_sort(&(hits_per_ref[now_vec_pos]), each_ref_size[i], mm);
         }
         open_nams.clear();
         unsigned int prev_q_start = 0;
@@ -461,17 +519,18 @@ __device__ void merge_hits_into_nams(
     t3 += clock64() - t_start;
 #endif
 
-    each_ref_size.release();
-    open_nams.release();
+//    each_ref_size.release();
+//    open_nams.release();
 
 }
 
 __device__ void merge_hits_into_nams_forward_and_reverse(
         my_vector<Nam>& nams,
-        my_vector<my_pair<int, Hit>> hits_per_ref[2],
+        my_vector<my_pair<int, Hit>>& hits_per_ref0,
+        my_vector<my_pair<int, Hit>>& hits_per_ref1,
         int k,
         bool sort,
-        my_pool& mpool,
+        MemoryManagerType* mm,
         unsigned long long &t1,
         unsigned long long &t2,
         unsigned long long &t3,
@@ -481,10 +540,8 @@ __device__ void merge_hits_into_nams_forward_and_reverse(
         unsigned long long &t3_4,
         unsigned long long &t3_5
 ) {
-    for (size_t is_revcomp = 0; is_revcomp < 2; ++is_revcomp) {
-        auto& hits_oriented = hits_per_ref[is_revcomp];
-        merge_hits_into_nams(hits_oriented, k, sort, is_revcomp, nams, mpool, t1, t2, t3, t3_1, t3_2, t3_3, t3_4, t3_5);
-    }
+    merge_hits_into_nams(hits_per_ref0, k, sort, 0, nams, mm, t1, t2, t3, t3_1, t3_2, t3_3, t3_4, t3_5);
+    merge_hits_into_nams(hits_per_ref1, k, sort, 1, nams, mm, t1, t2, t3, t3_1, t3_2, t3_3, t3_4, t3_5);
 }
 
 
@@ -523,7 +580,190 @@ __device__ void release_lock() {
 
 #define GPU_read_block_size 1
 
-__global__ void gpu_step2(
+__global__ void gpu_step3(
+    int bits,
+    unsigned int filter_cutoff,
+    int rescue_cutoff,
+    const RefRandstrobe *d_randstrobes,
+    size_t d_randstrobes_size,
+    const my_bucket_index_t *d_randstrobe_start_indices,
+    int num_reads,
+    IndexParameters *index_para,
+    int *randstrobe_sizes,
+    uint64_t *hashes,
+    MemoryManagerType* mm,
+    uint64_t *global_total_hits,
+    uint64_t *global_nr_good_hits,
+    Rescue_Seeds *rescue_seeds)
+{
+    int b_tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    int l_range = b_tid * GPU_read_block_size;
+    int r_range = l_range + GPU_read_block_size;
+    if (r_range > num_reads) r_range = num_reads;
+    unsigned long long t_time_tot = 0;
+    unsigned long long t_time1 = 0;
+    unsigned long long t_time2 = 0;
+    unsigned long long t_time2_1 = 0;
+    unsigned long long t_time2_2 = 0;
+    unsigned long long t_time3 = 0;
+    unsigned long long t_time4 = 0;
+    unsigned long long t_time5 = 0;
+    unsigned long long t_time4_1 = 0;
+    unsigned long long t_time4_2 = 0;
+    unsigned long long t_time4_2_1 = 0;
+    unsigned long long t_time4_2_2 = 0;
+    unsigned long long t_time4_3 = 0;
+    unsigned long long t_time4_3_1 = 0;
+    unsigned long long t_time4_3_2 = 0;
+    unsigned long long t_time4_3_3 = 0;
+    unsigned long long t_time4_3_4 = 0;
+    unsigned long long t_time4_3_5 = 0;
+
+    int tot_seeds_num = 0;
+
+#ifdef use_my_time
+    unsigned long long t_start = clock64();
+#endif
+
+    for (int tid = l_range; tid < r_range; tid++) {
+#ifdef use_my_time
+        unsigned long long t_start1, t_start2;
+        t_start1 = clock64();
+#endif
+        int rtid = rescue_seeds[tid].read_id;
+        int rv = rescue_seeds[tid].read_fr;
+        // if(rtid != 4000 || rv != 0) continue;
+        my_vector<my_pair<int, Hit>> hits_per_ref0(mm);
+        my_vector<my_pair<int, Hit>> hits_per_ref1(mm);
+
+        my_vector<RescueHit> hits_t0(mm);
+        my_vector<RescueHit> hits_t1(mm);
+
+        tot_seeds_num += rescue_seeds[tid].seeds_num;
+        // printf("seeds num %d\n", rescue_seeds[tid].seeds_num);
+        // for (int i = 0; i < rescue_seeds[tid].seeds_num; i++) {
+        //     QueryRandstrobe q = rescue_seeds[tid].seeds[i];
+        //     printf("hash %llu\n", q.hash);
+        // }
+#ifdef use_my_time
+        t_time1 += clock64() - t_start1;
+        t_start1 = clock64();
+#endif
+        for (int i = 0; i < rescue_seeds[tid].seeds_num; i++) {
+            QueryRandstrobe q = rescue_seeds[tid].seeds[i];
+#ifdef use_my_time
+            t_start2 = clock64();
+#endif
+            size_t position = gpu_find(d_randstrobes, d_randstrobe_start_indices, q.hash, bits);
+#ifdef use_my_time
+            t_time2_1 += clock64() - t_start2;
+            t_start2 = clock64();
+#endif
+            if (position != static_cast<size_t>(-1)) {
+                unsigned int count = gpu_get_count(d_randstrobes, d_randstrobe_start_indices, position, bits);
+                RescueHit rh{position, count, q.start, q.end};
+                if(q.is_reverse) hits_t1.push_back(rh);
+                else hits_t0.push_back(rh);
+            }
+#ifdef use_my_time
+            t_time2_2 += clock64() - t_start2;
+#endif
+        }
+#ifdef use_my_time
+        t_time2 += clock64() - t_start1;
+        t_start1 = clock64();
+#endif
+        quick_sort(&(hits_t0[0]), hits_t0.size(), mm);
+        int cnt = 0;
+        for (int i = 0; i < hits_t0.size(); i++) {
+            RescueHit &rh = hits_t0[i];
+            if ((rh.count > rescue_cutoff && cnt >= 5) || rh.count > 1000) {
+                break;
+            }
+            add_to_hits_per_ref(hits_per_ref0, rh.query_start, rh.query_end, rh.position, d_randstrobes, d_randstrobes_size, index_para->syncmer.k);
+            cnt++;
+        }
+        quick_sort(&(hits_t1[0]), hits_t1.size(), mm);
+        cnt = 0;
+        for (int i = 0; i < hits_t1.size(); i++) {
+            RescueHit &rh = hits_t1[i];
+            if ((rh.count > rescue_cutoff && cnt >= 5) || rh.count > 1000) {
+                break;
+            }
+            add_to_hits_per_ref(hits_per_ref1, rh.query_start, rh.query_end, rh.position, d_randstrobes, d_randstrobes_size, index_para->syncmer.k);
+            cnt++;
+        }
+#ifdef use_my_time
+        t_time3 += clock64() - t_start1;
+        t_start1 = clock64();
+#endif
+        my_vector<Nam> nams(mm);
+        merge_hits_into_nams_forward_and_reverse(nams, hits_per_ref0, hits_per_ref1, index_para->syncmer.k, true, mm, t_time4_1, t_time4_2, t_time4_3,
+                                                 t_time4_3_1, t_time4_3_2, t_time4_3_3, t_time4_3_4, t_time4_3_5);
+#ifdef use_my_time
+        t_time4 += clock64() - t_start1;
+        t_start1 = clock64();
+#endif
+        // quick_sort((Nam *)&(nams[0]), nams.size(), mm);
+        uint64_t local_total_hits = 0;
+        uint64_t local_nr_good_hits = 0;
+        for (int i = 0; i < nams.size(); i++) {
+            local_total_hits += nams[i].ref_id + nams[i].ref_start + nams[i].ref_end;
+            local_nr_good_hits += nams[i].score + nams[i].query_start + nams[i].query_end;
+        }
+        global_total_hits[rtid] = local_total_hits;
+        global_nr_good_hits[rtid] = local_nr_good_hits;
+#ifdef use_my_time
+        t_time5 += clock64() - t_start1;
+#endif
+        if (0) {
+            for (int i = 0; i < nams.size(); i++) {
+                printf("query_start: %d, query_end: %d, query_prev_hit_startpos: %d, ref_start: %d, ref_end: %d, ref_prev_hit_startpos: %d, n_hits: %d, ref_id: %d, score: %.2f\n",
+                       //                           nams[i].nam_id,
+                       nams[i].query_start,
+                       nams[i].query_end,
+                       nams[i].query_prev_hit_startpos,
+                       nams[i].ref_start,
+                       nams[i].ref_end,
+                       nams[i].ref_prev_hit_startpos,
+                       nams[i].n_hits,
+                       nams[i].ref_id,
+                       nams[i].score);
+            }
+            printf("\n\n");
+        }
+    }
+#ifdef use_my_time
+    t_time_tot += clock64() - t_start;
+    if(b_tid % 100 == 0) {
+        // printf all time info
+        printf("time3 %d %.3f : %.3f %.3f (%.3f %.3f) %.3f %.3f (%.3f %.3f %.3f [%.3f %.3f %.3f %.3f %.3f]) %.3f\n", 
+            tot_seeds_num, 
+            t_time_tot / 1e6, 
+            t_time1 / 1e6, 
+            t_time2 / 1e6, 
+            t_time2_1 / 1e6, 
+            t_time2_2 / 1e6, 
+            t_time3 / 1e6, 
+            t_time4 / 1e6, 
+            t_time4_1 / 1e6, 
+            t_time4_2 / 1e6, 
+            t_time4_3 / 1e6, 
+            t_time4_3_1 / 1e6, 
+            t_time4_3_2 / 1e6, 
+            t_time4_3_3 / 1e6, 
+            t_time4_3_4 / 1e6, 
+            t_time4_3_5 / 1e6, 
+            t_time5 / 1e6
+        );
+
+    }
+#endif
+}
+
+
+__global__ void gpu_step12(
         int bits,
         unsigned int filter_cutoff,
         int rescue_cutoff,
@@ -540,13 +780,15 @@ __global__ void gpu_step2(
         IndexParameters *index_para,
         int *randstrobe_sizes,
         uint64_t *hashes,
-        my_pool *mpools,
+        MemoryManagerType* mm,
         uint64_t *global_total_hits,
-        uint64_t *global_nr_good_hits
+        uint64_t *global_nr_good_hits,
+        int* rescue_read_num,
+        Rescue_Seeds *rescue_seeds
 ) {
     int b_tid = blockIdx.x * blockDim.x + threadIdx.x;
 
-    //if(b_tid != 4000) return;
+//     if(b_tid != 0) return;
 
     int l_range = b_tid * GPU_read_block_size;
     int r_range = l_range + GPU_read_block_size;
@@ -576,7 +818,6 @@ __global__ void gpu_step2(
 #ifdef use_my_time
             unsigned long long t_start = clock64();
 #endif
-            my_pool mpool = mpools[tid];
 
             size_t len;
             char *seq;
@@ -591,11 +832,11 @@ __global__ void gpu_step2(
             // step1: get randstrobes
             unsigned long long t_start1;
 
-            my_vector<QueryRandstrobe> randstrobes(&mpool);
+            my_vector<QueryRandstrobe> randstrobes(mm);
 
-            my_vector<Syncmer> syncmers(&mpool);
+            my_vector<Syncmer> syncmers(mm);
 
-            my_vector<uint64_t> vec4syncmers(&mpool);
+            my_vector<uint64_t> vec4syncmers(mm);
 
             if (len < (*index_para).randstrobe.w_max) {
                 // randstrobes == null
@@ -646,8 +887,8 @@ __global__ void gpu_step2(
 
                 }
             }
-            syncmers.release();
-            vec4syncmers.release();
+//            syncmers.release();
+//            vec4syncmers.release();
 #ifdef use_my_time
             t_time1 += clock64() - t_start;
 #endif
@@ -668,9 +909,9 @@ __global__ void gpu_step2(
 #ifdef use_my_time
             t_start = clock64();
 #endif
-            my_vector<my_pair<int, Hit>> hits_per_ref[2];
-            hits_per_ref[0] = my_vector<my_pair<int, Hit>>(&mpool);
-            hits_per_ref[1] = my_vector<my_pair<int, Hit>>(&mpool);
+
+            my_vector<my_pair<int, Hit>> hits_per_ref0(mm);
+            my_vector<my_pair<int, Hit>> hits_per_ref1(mm);
 
             uint64_t local_total_hits = 0;
             uint64_t local_nr_good_hits = 0;
@@ -678,7 +919,7 @@ __global__ void gpu_step2(
             for (int i = 0; i < randstrobes.size(); i++) {
                 QueryRandstrobe q = randstrobes[i];
                 size_t position = gpu_find(d_randstrobes, d_randstrobe_start_indices, q.hash, bits);
-//                printf("poss %llu\n", position);
+                // printf("poss %llu, hash %llu\n", position, q.hash);
                 if (position != static_cast<size_t>(-1)) {
                     local_total_hits++;
                     bool res = gpu_is_filtered(d_randstrobes, d_randstrobes_size, position, filter_cutoff);
@@ -686,7 +927,11 @@ __global__ void gpu_step2(
                         continue;
                     }
                     local_nr_good_hits++;
-                    add_to_hits_per_ref(hits_per_ref[q.is_reverse], q.start, q.end, position, d_randstrobes, d_randstrobes_size, index_para->syncmer.k);
+                    if(q.is_reverse) {
+                        add_to_hits_per_ref(hits_per_ref1, q.start, q.end, position, d_randstrobes, d_randstrobes_size, index_para->syncmer.k);
+                    } else {
+                        add_to_hits_per_ref(hits_per_ref0, q.start, q.end, position, d_randstrobes, d_randstrobes_size, index_para->syncmer.k);
+                    }
                 }
             }
 #ifdef use_my_time
@@ -697,24 +942,16 @@ __global__ void gpu_step2(
 #ifdef use_my_time
             t_start = clock64();
 #endif
-            my_vector<Nam> nams(&mpool);
+            my_vector<Nam> nams(mm);
 
-            float nonrepetitive_fraction = local_total_hits > 0 ? ((float) local_nr_good_hits) / ((float) local_total_hits) : 1.0;
-            merge_hits_into_nams_forward_and_reverse(nams, hits_per_ref, index_para->syncmer.k, false, mpool, t_time4_1, t_time4_2, t_time4_3,
+            float nonrepetitive_fraction = 1;
+            nonrepetitive_fraction = local_total_hits > 0 ? ((float) local_nr_good_hits) / ((float) local_total_hits) : 1.0;
+            merge_hits_into_nams_forward_and_reverse(nams, hits_per_ref0, hits_per_ref1, index_para->syncmer.k, false, mm, t_time4_1, t_time4_2, t_time4_3,
                          t_time4_3_1, t_time4_3_2, t_time4_3_3, t_time4_3_4, t_time4_3_5);
 //            printf("float %f\n", nonrepetitive_fraction);
 
 #ifdef use_my_time
             t_time4 += clock64() - t_start;
-#endif
-
-
-#ifdef use_my_time
-            t_start = clock64();
-#endif
-
-#ifdef use_my_time
-            t_time5 += clock64() - t_start;
 #endif
 
             // step3: rescue nams
@@ -723,60 +960,38 @@ __global__ void gpu_step2(
 #endif
             int call_re = 0;
             if (nams.size() == 0 || nonrepetitive_fraction < 0.7) {
-                call_re = 1;
-            //if (1) {
-                //printf("start rescue, nonrepetitive_fraction %f %d\n", nonrepetitive_fraction, tid);
-                hits_per_ref[0].clear();
-                hits_per_ref[1].clear();
-                my_vector<RescueHit> hits_t[2];
-                hits_t[0] = my_vector<RescueHit>(&mpool);
-                hits_t[1] = my_vector<RescueHit>(&mpool);
-
-                for (int i = 0; i < randstrobes.size(); i++) {
-                    QueryRandstrobe q = randstrobes[i];
-                    size_t position = gpu_find(d_randstrobes, d_randstrobe_start_indices, q.hash, bits);
-                    if (position != static_cast<size_t>(-1)) {
-                        unsigned int count = gpu_get_count(d_randstrobes, d_randstrobe_start_indices, position, bits);
-                        RescueHit rh{position, count, q.start, q.end};
-                        hits_t[q.is_reverse].push_back(rh);
-                    }
-                }
-
-                for (int is_revcomp = 0; is_revcomp < 2; is_revcomp++) {
-                    quick_sort(&(hits_t[is_revcomp][0]), hits_t[is_revcomp].size(), mpool);
-                    int cnt = 0;
-                    for (int i = 0; i < hits_t[is_revcomp].size(); i++) {
-                        RescueHit& rh = hits_t[is_revcomp][i];
-                        if ((rh.count > rescue_cutoff && cnt >= 5) || rh.count > 1000) {
-                            break;
-                        }
-                        add_to_hits_per_ref(hits_per_ref[is_revcomp], rh.query_start, rh.query_end, rh.position, d_randstrobes, d_randstrobes_size, index_para->syncmer.k);
-                        cnt++;
-                    }
-                }
-                nams.clear();
-                merge_hits_into_nams_forward_and_reverse(nams, hits_per_ref, index_para->syncmer.k, true, mpool, t_time4_1, t_time4_2, t_time4_3,
-                                                         t_time4_3_1, t_time4_3_2, t_time4_3_3, t_time4_3_4, t_time4_3_5);
+//                call_re = 1;
+//                atomicAdd((unsigned long long int*)rescue_read_num, 1ULL);
+//                // copy seeds to rescue_seeds
+//                rescue_seeds[*rescue_read_num].read_id = tid;
+//                rescue_seeds[*rescue_read_num].read_fr = rev;
+//                rescue_seeds[*rescue_read_num].seeds_num = randstrobes.size();
+//                // use for loop to copy the data
+//                for (int i = 0; i < randstrobes.size(); i++) {
+//                    rescue_seeds[*rescue_read_num].seeds[i] = randstrobes[i];
+//                }
             }
 #ifdef use_my_time
-            t_time6 += clock64() - t_start;
+            t_time5 += clock64() - t_start;
 #endif
             //bubble_sort((Nam*)&(nams[0]), nams.size());
-            //quick_sort((Nam*)&(nams[0]), nams.size(), mpool);
+            //quick_sort((Nam*)&(nams[0]), nams.size(), mm);
+
+            for(int i = 0; i < nams.size(); i++) {
+                local_total_hits += nams[i].ref_id + nams[i].ref_start + nams[i].ref_end;
+                local_nr_good_hits += nams[i].score + nams[i].query_start + nams[i].query_end;
+            }
+            global_total_hits[tid] += local_total_hits;
+            global_nr_good_hits[tid] += local_nr_good_hits;
+            //global_total_hits[tid] += randstrobes.size() * sizeof(QueryRandstrobe);
+            //global_nr_good_hits[tid] += call_re * randstrobes.size() * sizeof(QueryRandstrobe);
 
 
-            //for(int i = 0; i < nams.size(); i++) {
-            //    local_total_hits += nams[i].ref_id + nams[i].ref_start + nams[i].ref_end;
-            //    local_nr_good_hits += nams[i].score + nams[i].query_start + nams[i].query_end;
-            //}
-            //global_total_hits[tid] = local_total_hits;
-            //global_nr_good_hits[tid] = local_nr_good_hits;
-            global_total_hits[tid]++;
-            global_nr_good_hits[tid] += call_re;
-
+            // global_total_hits[tid] += 1;
+            // global_nr_good_hits[tid] += call_re;
 
             if(0) {
-                printf("total_hits %llu, nr_good_hits %llu, nonrepetitive_fraction %.3f, nam size %d\n", local_total_hits, local_nr_good_hits, nonrepetitive_fraction, nams.size());
+//                printf("total_hits %llu, nr_good_hits %llu, nonrepetitive_fraction %.3f, nam size %d\n", local_total_hits, local_nr_good_hits, nonrepetitive_fraction, nams.size());
                 for(int i = 0; i < nams.size(); i++) {
                     printf("query_start: %d, query_end: %d, query_prev_hit_startpos: %d, ref_start: %d, ref_end: %d, ref_prev_hit_startpos: %d, n_hits: %d, ref_id: %d, score: %.2f\n",
 //                           nams[i].nam_id,
@@ -796,11 +1011,14 @@ __global__ void gpu_step2(
     }
 
 #ifdef use_my_time
-    if(b_tid % 100000 == 0) {
-//        acquire_lock();
-        printf("btid %d, time %.3f %.3f %.3f %.3f ( %.3f %.3f %.3f [ %.3f %.3f %.3f %.3f %.3f ] ) %.3f %.3f\n", b_tid, t_time1 / 1e6, t_time2 / 1e6, t_time3 / 1e6, t_time4 / 1e6, t_time4_1 / 1e6, t_time4_2 / 1e6, t_time4_3 / 1e6, t_time4_3_1 / 1e6, t_time4_3_2 / 1e6, t_time4_3_3 / 1e6, t_time4_3_4 / 1e6, t_time4_3_5 / 1e6, t_time5 / 1e6, t_time6 / 1e6);
-//        release_lock();
-    }
+     if(b_tid == 0) {
+ //        acquire_lock();
+         printf("btid %d, time12 %.3f %.3f %.3f %.3f ( %.3f %.3f %.3f [ %.3f %.3f %.3f %.3f %.3f ] ) %.3f %.3f\n",
+                b_tid, t_time1 / 1e6, t_time2 / 1e6, t_time3 / 1e6, t_time4 / 1e6, t_time4_1 / 1e6, t_time4_2 / 1e6,
+                t_time4_3 / 1e6, t_time4_3_1 / 1e6, t_time4_3_2 / 1e6, t_time4_3_3 / 1e6, t_time4_3_4 / 1e6, t_time4_3_5 / 1e6,
+                t_time5 / 1e6);
+ //        release_lock();
+     }
 #endif
 
 }
@@ -827,6 +1045,8 @@ klibpp::KSeq ConvertNeo2KSeq(neoReference ref) {
 
 static Logger &logger = Logger::get();
 
+
+//#include <gallatin/allocators/global_allocator.cuh>
 
 int main(int argc, char **argv) {
     auto opt = parse_command_line_arguments(argc, argv);
@@ -919,22 +1139,21 @@ int main(int argc, char **argv) {
               << index.randstrobes.size() * sizeof(RefRandstrobe) +
                  index.randstrobe_start_indices.size() * sizeof(my_bucket_index_t) << std::endl;
 
-#define batch_size 5000
+
+#define batch_size 50000ll
 #define batch_seq_szie batch_size * 250ll
 
-    t0 = GetTime();
-    char *d_mpools_data;
-    cudaMalloc(&d_mpools_data, batch_size * vec_block_size);
-    cudaMemset(d_mpools_data, 0, batch_size * vec_block_size);
-    printf("device addr %p\n", d_mpools_data);
-    my_pool *h_mpools = new my_pool[batch_size];
-    for (int i = 0; i < batch_size; i++) {
-        h_mpools[i].size = vec_block_size;
-        h_mpools[i].data = d_mpools_data + i * vec_block_size;
-    }
-    my_pool *d_mpools;
-    cudaMalloc(&d_mpools, batch_size * sizeof(my_pool));
-    std::cout << "buffer malloc execution time: " << GetTime() - t0 << std::endl;
+    size_t instantitation_size = 8ll * 1024ll;
+    MemoryManagerType memory_manager;
+    memory_manager.initialize(instantitation_size);
+
+    uint64_t num_bytes = 12ll * 1024ll * 1024ll * 1024ll; // 8GB
+    uint64_t seed = 13;
+    init_mm(num_bytes, seed);
+//    gallatin::allocators::init_global_allocator(num_bytes, seed);
+//    init_global_allocator(num_bytes, seed);
+
+    printf("Gallatin global allocator initialized with %lu bytes.\n", num_bytes);
 
     int *a_randstrobe_sizes;
     cudaMallocManaged(&a_randstrobe_sizes, batch_size * sizeof(int));
@@ -976,10 +1195,13 @@ int main(int argc, char **argv) {
     int *h_pre_sum2 = new int[batch_size + 1];
     char *h_seq2 = new char[batch_seq_szie];
 
-    double gpu_cost = 0;
+    double gpu_cost1 = 0;
+    double gpu_cost2 = 0;
     double tot_cost = 0;
     size_t check_sum = 0;
     size_t size_tot = 0;
+    size_t seeds_size_tot = 0;
+    size_t seeds_size_rescue = 0;
 
     uint64_t h_global_total_hits = 0;
     uint64_t * a_global_total_hits;
@@ -989,10 +1211,20 @@ int main(int argc, char **argv) {
     uint64_t * a_global_nr_good_hits;
     cudaMallocManaged(&a_global_nr_good_hits, batch_size * sizeof(uint64_t));
 
+    int* a_rescue_read_num;
+    cudaMallocManaged(&a_rescue_read_num, sizeof(int));
+
+    Rescue_Seeds* a_rescue_seeds;
+    cudaMallocManaged(&a_rescue_seeds, batch_size * 2 * sizeof(Rescue_Seeds));
+    for(int i = 0; i < batch_size * 2; i++) {
+        cudaMallocManaged(&(a_rescue_seeds[i].seeds), 250 * sizeof(QueryRandstrobe));
+    }
+
     assert(records1.size() == records2.size());
 
     t0 = GetTime();
     for (int l_id = 0; l_id < records1.size(); l_id += batch_size) {
+        printf("process %d / %d\n", l_id, records1.size());
         int r_id = l_id + batch_size;
         if (r_id > records1.size()) r_id = records1.size();
         int s_len = r_id - l_id;
@@ -1027,47 +1259,84 @@ int main(int argc, char **argv) {
 
         cudaMemcpy(d_index_para, &index_parameters, sizeof(IndexParameters), cudaMemcpyHostToDevice);
 
+
         for (int i = 0; i < s_len; i++) {
-            for(int j = 0; j < (1 << vec_block_num_shift); j++)
-                h_mpools[i].used[j] = 0;
-            h_mpools[i].pos = 0;
             a_randstrobe_sizes[i] = 0;
             a_hashes[i] = 0;
             a_global_total_hits[i] = 0;
             a_global_nr_good_hits[i] = 0;
+            a_rescue_seeds[i].read_id = 0;
+            a_rescue_seeds[i].seeds_num = 0;
         }
-        cudaMemcpy(d_mpools, h_mpools, s_len * sizeof(my_pool), cudaMemcpyHostToDevice);
+
+        *a_rescue_read_num = 0;
 
         double t1 = GetTime();
         int threads_per_block = 1;
         int reads_per_block = threads_per_block * GPU_read_block_size;
         int blocks_per_grid = (s_len + reads_per_block - 1) / reads_per_block;
-        gpu_step2<<<blocks_per_grid, threads_per_block>>>(index.bits, index.filter_cutoff, para_rescue_cutoff, d_randstrobes,
+        gpu_step12<<<blocks_per_grid, threads_per_block>>>(index.bits, index.filter_cutoff, para_rescue_cutoff, d_randstrobes,
+        // gpu_step12<<<1, 1>>>(index.bits, index.filter_cutoff, para_rescue_cutoff, d_randstrobes,
                                                           index.randstrobes.size(), d_randstrobe_start_indices,
                                                           s_len, d_pre_sum, d_len, d_seq, d_pre_sum2, d_len2, d_seq2,
                                                           d_index_para,
-                                                          a_randstrobe_sizes, a_hashes, d_mpools, a_global_total_hits,
-                                                          a_global_nr_good_hits);
+                                                          a_randstrobe_sizes, a_hashes, memory_manager.getDeviceMemoryManager(), a_global_total_hits,
+                                                          a_global_nr_good_hits,
+                                                          a_rescue_read_num, a_rescue_seeds
+                                                          );
         cudaDeviceSynchronize();
-        gpu_cost += GetTime() - t1;
+        gpu_cost1 += GetTime() - t1;
+
+        // print a_rescue_read_num
+//        printf("rescue read num %d\n", *a_rescue_read_num);
+
+#define rescue_batch_size 256
+
+
+        for(int i = 0; i < *a_rescue_read_num; i += rescue_batch_size) {
+            int r_id = i + rescue_batch_size;
+            if(r_id > *a_rescue_read_num) r_id = *a_rescue_read_num;
+            int local_rescue_read_num = r_id - i;
+
+            t1 = GetTime();
+            threads_per_block = 256;
+            reads_per_block = threads_per_block * GPU_read_block_size;
+            blocks_per_grid = (local_rescue_read_num + reads_per_block - 1) / reads_per_block;
+//            gpu_step3<<<blocks_per_grid, threads_per_block>>>(index.bits, index.filter_cutoff, para_rescue_cutoff, d_randstrobes,
+//            // gpu_step3<<<1, 1>>>(index.bits, index.filter_cutoff, para_rescue_cutoff, d_randstrobes,
+//                                                             index.randstrobes.size(), d_randstrobe_start_indices,
+//                                                             local_rescue_read_num,
+//                                                             d_index_para,
+//                                                             a_randstrobe_sizes, a_hashes, memory_manager.getDeviceMemoryManager(), a_global_total_hits,
+//                                                             a_global_nr_good_hits,
+//                                                             a_rescue_seeds + i
+//                                                             );
+//            cudaDeviceSynchronize();
+            gpu_cost2 += GetTime() - t1;
+        }
+
 
         for (size_t i = 0; i < s_len; ++i) {
             size_tot += a_randstrobe_sizes[i];
+            check_sum += a_hashes[i];
             h_global_total_hits += a_global_total_hits[i];
             h_global_nr_good_hits += a_global_nr_good_hits[i];
+            //seeds_size_tot += a_global_total_hits[i];
+            //seeds_size_rescue += a_global_nr_good_hits[i];
         }
-        for (size_t i = 0; i < 1; ++i) {
-            int id = rand() % s_len;
-            //int id = i;
-            check_sum += a_randstrobe_sizes[id];
-        }
+        // for (size_t i = 0; i < 1; ++i) {
+        //     int id = rand() % s_len;
+        //     //int id = i;
+        //     check_sum += a_randstrobe_sizes[id];
+        // }
     }
     tot_cost += GetTime() - t0;
 
-    std::cout << "gpu cost " << gpu_cost << std::endl;
+    std::cout << "gpu cost " << gpu_cost1 << " " << gpu_cost2 << std::endl;
     std::cout << "total cost " << tot_cost << std::endl;
     std::cout << "check_sum : " << check_sum << ", size_tot : " << size_tot << std::endl;
     std::cout << "total_hits : " << h_global_total_hits << ", nr_good_hits : " << h_global_nr_good_hits << std::endl;
+    //std::cout << "seed size: " << seeds_size_tot << ", rescue: " << seeds_size_rescue << std::endl;
 
     t0 = GetTime();
     cudaFree(d_seq);
@@ -1081,6 +1350,9 @@ int main(int argc, char **argv) {
     delete h_pre_sum;
     std::cout << "free execution time: " << GetTime() - t0 << " seconds" << std::endl;
 
+    free_mm();
+//    gallatin::allocators::free_global_allocator();
+//    free_global_allocator();
     return 0;
 }
 

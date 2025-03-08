@@ -3,19 +3,16 @@
 
 #include <iostream>
 #include <stdexcept>
-#include <cuda_runtime.h>
+#include <cassert>
+#include "device/Ouroboros_impl.cuh"
+#include "device/MemoryInitialization.cuh"
+#include "InstanceDefinitions.cuh"
+#include "Utility.h"
 
-#define vec_block_num_shift 3
-#define vec_block_size_shift 16
-#define vec_pre_block_size (1ll << vec_block_size_shift)
-#define vec_block_size (1ll << (vec_block_size_shift + vec_block_num_shift))
+using MemoryManagerType = MultiOuroVLPQ;
 
-struct my_pool {
-    void* data;
-    int size;
-    int pos;
-    int used[1 << vec_block_num_shift];
-};
+
+//#include <gallatin/allocators/global_allocator.cuh>
 
 struct Hit {
     int query_start;
@@ -47,109 +44,58 @@ struct RescueHit {
     }
 };
 
+//inline __device__ void* my_malloc(size_t size, MemoryManagerType* mm) {
+//    void* ptr = gallatin::allocators::global_malloc(size);
+//    return ptr;
+//}
+//
+//inline __device__ void my_free(void* ptr, MemoryManagerType* mm) {
+//    gallatin::allocators::global_free(ptr);
+//}
 
-#define use_my_pool
+__device__ void* my_malloc(size_t size, MemoryManagerType* mm);
+__device__ void my_free(void* ptr, MemoryManagerType* mm);
 
-#ifdef use_my_pool
+__host__ void init_mm(uint64_t num_bytes, uint64_t seed);
+__host__ void free_mm();
+
 template <typename T>
 struct my_vector {
     T* data = nullptr;
     int length;
     int capacity;
-    my_pool *mpool;
-    int free_pos;
+    MemoryManagerType* mm_pool;
 
-    __device__ my_vector() : data(nullptr), length(0), capacity(0), mpool(nullptr), free_pos(-1) {
-        //printf("null vec %d\n", free_pos);
-    }
+//    __device__ my_vector() : data(nullptr), length(0), capacity(0), mm_pool(nullptr) {
+//    }
 
-    __device__ my_vector(my_pool* mpool_, int cap_ = vec_pre_block_size) {
-        mpool = mpool_;
-        free_pos = -1;
-        for(int i = 0; i < (1 << vec_block_num_shift); i++) {
-            if(mpool->used[i] == 0) {
-                free_pos = i;
-                mpool->used[i] = 1;
-                break;
-            }
-        }
-        data = (T*) (mpool->data + free_pos * cap_);
-        length = 0;
-        capacity = cap_ / sizeof(T);
-        if(free_pos == -1) printf("mpool OOM\n");
-        //else printf("get pos %d, ptr %p, size %d\n", free_pos, data, capacity);
-    }
-
-    __device__ ~my_vector() {
-        //if(free_pos != -1) {
-        //    mpool->used[free_pos] = 0;
-        //    printf("free1 pos %d\n", free_pos);
-        //}
-        //free_pos = -1;
-    }
-
-    __device__ void release() {
-        if(free_pos != -1) {
-            mpool->used[free_pos] = 0;
-            //printf("free2 pos %d\n", free_pos);
-        }
-        free_pos = -1;
-    }
-
-    __device__ void push_back(const T& value) {
-        data[length++] = value;
-        if(length >= capacity) {
-            printf("OOM %d %d, T %d\n", length, capacity, sizeof(T));
-//            exit(0);
-        }
-    }
-
-    __device__ int size() const {
-        return length;
-    }
-
-    __device__ void clear() {
-        length = 0;
-    }
-
-
-    __device__ T& operator[](int index) {
-        return data[index];
-    }
-
-    __device__ const T& operator[](int index) const {
-        return data[index];
-    }
-};
-
-#else
-
-template <typename T>
-struct my_vector {
-    T* data = nullptr;
-    int capacity = 64;
-    int length = 0;
-    void *d_buffer_ptr;
-
-    __device__ my_vector(void *buffer_ptr, int N = 64) {
+    __device__ my_vector(MemoryManagerType* mm_, int N = 4) {
+        mm_pool = mm_;
         capacity = N;
         length = 0;
-        data = (T*)malloc(capacity * sizeof(T));
-        memset(data, 0, capacity * sizeof(T));
+        data = (T*)my_malloc(capacity * sizeof(T), mm_pool);
     }
 
     __device__ ~my_vector() {
         if (data != nullptr) {
-            free(data);
-            //cudaFree(data);
+            my_free(data, mm_pool);
         }
+        data = nullptr;
+    }
+
+    __device__ void resize(int new_capacity) {
+        T* new_data;
+        new_data = (T*)my_malloc(new_capacity * sizeof(T), mm_pool);
+        for (int i = 0; i < length; ++i) new_data[i] = data[i];
+        if (data != nullptr) my_free(data, mm_pool);
+        data = new_data;
+        capacity = new_capacity;
     }
 
     __device__ void push_back(const T& value) {
         if (length == capacity) {
             resize(capacity == 0 ? 1 : capacity * 2);
         }
-
         data[length++] = value;
     }
 
@@ -161,56 +107,33 @@ struct my_vector {
         length = 0;
     }
 
+    __device__ void release() {
+        if (data != nullptr) {
+            my_free(data, mm_pool);
+//            free(data);
+        }
+        data = nullptr;
+    }
+
 
     __device__ T& operator[](int index) {
-        if (index >= length) {
-            // Custom error handling instead of throwing an exception
-            printf("Index out of range %d %d\n", index, length);
-            return data[0]; // Return some valid reference (this can be adjusted)
-        }
+//        if (index >= length) {
+//            printf("Index out of range %d %d\n", index, length);
+//            assert(false);
+//        }
         return data[index];
     }
 
     __device__ const T& operator[](int index) const {
-        if (index >= length) {
-            // Custom error handling instead of throwing an exception
-            printf("Index out of range %d %d\n", index, length);
-            return data[0]; // Return some valid reference (this can be adjusted)
-        }
+//        if (index >= length) {
+//            printf("Index out of range %d %d\n", index, length);
+//            assert(false);
+//        }
         return data[index];
     }
 
-private:
-    __device__ void resize(int new_capacity) {
-        T* new_data;
-        //cudaMalloc(&new_data, new_capacity * sizeof(T));
-        new_data = (T*)malloc(new_capacity * sizeof(T));
-        printf("resize %d\n", new_capacity);
 
-        if (new_data == nullptr) {
-            // Custom error handling for memory allocation failure
-            printf("Memory allocation failed\n");
-            return;
-        }
-
-        // Copy old data to new memory
-        for (int i = 0; i < length; ++i) {
-            new_data[i] = data[i];
-        }
-
-        // Free old memory
-        if (data != nullptr) {
-            free(data);
-            //cudaFree(data);
-        }
-
-        // Update the vector with new data
-        data = new_data;
-        capacity = new_capacity;
-    }
 };
-#endif
-
 
 template <typename T>
 __device__ void my_swap(T& a, T& b) {

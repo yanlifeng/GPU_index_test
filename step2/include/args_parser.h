@@ -43,7 +43,7 @@ class Parameters{
         int n_threads;
         int32_t k_band;
 
-        Bool secondBest;
+        //Bool secondBest;
 
         bool isPacked;
         bool isReverseComplement;
