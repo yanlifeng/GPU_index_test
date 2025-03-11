@@ -1,4 +1,4 @@
-grep time3 $1 | awk '
+grep $2 $1 | awk '
 {
     for (i = 3; i <= NF; i++) {
         if ($i ~ /^[0-9.]+$/)  # 只处理数值

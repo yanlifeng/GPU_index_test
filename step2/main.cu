@@ -36,7 +36,7 @@
 
 #define my_bucket_index_t StrobemerIndex::bucket_index_t
 
-#define rescue_threshold 1000
+#define rescue_threshold 100
 
 inline double GetTime() {
     struct timeval tv;
@@ -283,8 +283,8 @@ const int mx_ref_id = 2800;
 //__shared__ my_pair<int, Hit> fast_hits_per_ref1[1000];
 //__shared__ int f0_size;
 //__shared__ int f1_size;
-__shared__ my_vector<Hit>* tot_ref_id_table0[mx_ref_id];
-__shared__ my_vector<Hit>* tot_ref_id_table1[mx_ref_id];
+//__shared__ my_vector<Hit>* tot_ref_id_table0[mx_ref_id];
+//__shared__ my_vector<Hit>* tot_ref_id_table1[mx_ref_id];
 
 
 struct Rescue_Seeds {
@@ -505,8 +505,11 @@ __device__ void merge_hits_into_nams(
 }
 
 
+#define MAX_HITS 2048
+#define BLOCK_SIZE 32
+#define ITEMS_PER_THREAD 64
 
-__device__ void old_fast_merge_hits_into_nams(
+__device__ void fast_merge_hits_into_nams(
         my_vector<my_pair<int, Hit>>& hits_per_ref,
         int k,
         bool sort,
@@ -520,7 +523,8 @@ __device__ void old_fast_merge_hits_into_nams(
         unsigned long long &t3_2,
         unsigned long long &t3_3,
         unsigned long long &t3_4,
-        unsigned long long &t3_5
+        unsigned long long &t3_5,
+        int btid
 ) {
 
     if(hits_per_ref.size() == 0) return;
@@ -529,11 +533,82 @@ __device__ void old_fast_merge_hits_into_nams(
 #ifdef use_my_time
     t_start = clock64();
 #endif
-    __shared__ my_vector<Hit>* tot_ref_id_table[mx_ref_id * 2];
-    my_vector<Hit>** ref_id_table = &(tot_ref_id_table[threadIdx.x * mx_ref_id]);
-    for(int i = 0; i < mx_ref_id; i++) {
-        ref_id_table[i] = nullptr;
+
+    int num_hits = hits_per_ref.size();
+    if (num_hits > MAX_HITS) {
+//    if (1) {
+        if(btid == 0) quick_sort(&(hits_per_ref[0]), num_hits, mm);
+    } else {
+        typedef cub::BlockRadixSort<unsigned long long, BLOCK_SIZE, ITEMS_PER_THREAD, int> BlockRadixSort;
+        __shared__ typename BlockRadixSort::TempStorage temp_storage;
+
+        unsigned long long thread_keys[ITEMS_PER_THREAD];
+        int thread_indices[ITEMS_PER_THREAD];
+
+        __shared__ int old_ref_end[MAX_HITS];
+        __shared__ int old_query_end[MAX_HITS];
+
+        for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+            int idx = btid + i * BLOCK_SIZE;
+            if (idx < num_hits) {
+                thread_keys[i] = (static_cast<unsigned long long>(hits_per_ref[idx].first) << 48) |
+                                 (static_cast<unsigned long long>(hits_per_ref[idx].second.query_start & 0xFFFF) << 32) |
+                                 (static_cast<unsigned long long>(hits_per_ref[idx].second.ref_start) & 0xFFFFFFFF);
+                thread_indices[i] = idx;
+                old_ref_end[idx] = hits_per_ref[idx].second.ref_end;
+                old_query_end[idx] = hits_per_ref[idx].second.query_end;
+            } else {
+                thread_keys[i] = ULLONG_MAX;
+                thread_indices[i] = -1;
+                old_ref_end[idx] = 0;
+                old_query_end[idx] = 0;
+            }
+        }
+        __syncthreads();
+//        if(btid == 0) {
+//            printf("thread_keys\n");
+//            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+//                printf("%llu ", thread_keys[i]);
+//            }
+//            printf("\n");
+//            printf("thread_indices\n");
+//            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+//                printf("%d ", thread_indices[i]);
+//            }
+//            printf("\n");
+//        }
+
+        BlockRadixSort(temp_storage).Sort(thread_keys, thread_indices);
+        __syncthreads();
+
+//        if(btid == 0) {
+//            printf("thread_keys\n");
+//            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+//                printf("%llu ", thread_keys[i]);
+//            }
+//            printf("\n");
+//            printf("thread_indices\n");
+//            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+//                printf("%d ", thread_indices[i]);
+//            }
+//            printf("\n");
+//        }
+
+        for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+            int idx = btid + i * BLOCK_SIZE;
+            if (idx < num_hits) {
+                hits_per_ref[idx].first = thread_keys[i] >> 48;
+                hits_per_ref[idx].second.query_start = (thread_keys[i] >> 32) & 0xFFFF;
+                hits_per_ref[idx].second.ref_start = thread_keys[i] & 0xFFFFFFFF;
+                hits_per_ref[idx].second.ref_end = old_ref_end[thread_indices[i]];
+                hits_per_ref[idx].second.query_end = old_query_end[thread_indices[i]];
+            }
+        }
+        __syncthreads();
     }
+
+    if(btid) return;
+
 #ifdef use_my_time
     t1 += clock64() - t_start;
 #endif
@@ -542,16 +617,29 @@ __device__ void old_fast_merge_hits_into_nams(
 #ifdef use_my_time
     t_start = clock64();
 #endif
-    for(int i = 0; i < hits_per_ref.size(); i++) {
+    int ref_num = 0;
+    my_vector<int> each_ref_size(mm);
+    int pre_ref_id = hits_per_ref[0].first;;
+    int now_ref_num = 1;
+    for(int i = 1; i < hits_per_ref.size(); i++) {
         int ref_id = hits_per_ref[i].first;
-        if(ref_id_table[ref_id] == nullptr) {
-            ref_id_table[ref_id] = new my_vector<Hit>(mm);
+        Hit hit = hits_per_ref[i].second;
+        if(ref_id != pre_ref_id) {
+            ref_num++;
+            pre_ref_id = ref_id;
+            each_ref_size.push_back(now_ref_num);
+            now_ref_num = 1;
+        } else {
+            now_ref_num++;
         }
-        ref_id_table[ref_id]->push_back(hits_per_ref[i].second);
     }
+    ref_num++;
+    each_ref_size.push_back(now_ref_num);
+//    printf("ref_num is %d\n", ref_num);
 #ifdef use_my_time
     t2 += clock64() - t_start;
 #endif
+
 
     my_vector<Nam> open_nams(mm);
 
@@ -559,18 +647,17 @@ __device__ void old_fast_merge_hits_into_nams(
     t_start = clock64();
 #endif
     int now_vec_pos = 0;
-    for (int i = 0; i < mx_ref_id; i++) {
-        if(ref_id_table[i] == nullptr) continue;
+    for (int i = 0; i < ref_num; i++) {
 
         unsigned long long t_start1;
 #ifdef use_my_time
         t_start1 = clock64();
 #endif
-        int ref_id = i;
-        my_vector<Hit>& hits = *ref_id_table[i];
+        if(i != 0) now_vec_pos += each_ref_size[i - 1];
+        int ref_id = hits_per_ref[now_vec_pos].first;
         if (sort) {
 //            std::sort(hits.begin(), hits.end());
-            quick_sort(&(hits[0]), hits.size(), mm);
+//            quick_sort(&(hits_per_ref[now_vec_pos]), each_ref_size[i], mm);
         }
         open_nams.clear();
         unsigned int prev_q_start = 0;
@@ -578,221 +665,11 @@ __device__ void old_fast_merge_hits_into_nams(
         t3_1 += clock64() - t_start1;
 #endif
 
-        for (int j = 0; j < hits.size(); j++) {
+        for (int j = 0; j < each_ref_size[i]; j++) {
 #ifdef use_my_time
             t_start1 = clock64();
 #endif
-            Hit& h = hits[j];
-            bool is_added = false;
-            for (int k = 0; k < open_nams.size(); k++) {
-                Nam& o = open_nams[k];
-
-                // Extend NAM
-                if ((o.query_prev_hit_startpos < h.query_start) && (h.query_start <= o.query_end ) && (o.ref_prev_hit_startpos < h.ref_start) && (h.ref_start <= o.ref_end) ){
-                    if ( (h.query_end > o.query_end) && (h.ref_end > o.ref_end) ) {
-                        o.query_end = h.query_end;
-                        o.ref_end = h.ref_end;
-                        //                        o.previous_query_start = h.query_s;
-                        //                        o.previous_ref_start = h.ref_s; // keeping track so that we don't . Can be caused by interleaved repeats.
-                        o.query_prev_hit_startpos = h.query_start;
-                        o.ref_prev_hit_startpos = h.ref_start;
-                        o.n_hits ++;
-                        //                        o.score += (float)1/ (float)h.count;
-                        is_added = true;
-                        break;
-                    }
-                    else if ((h.query_end <= o.query_end) && (h.ref_end <= o.ref_end)) {
-                        //                        o.previous_query_start = h.query_s;
-                        //                        o.previous_ref_start = h.ref_s; // keeping track so that we don't . Can be caused by interleaved repeats.
-                        o.query_prev_hit_startpos = h.query_start;
-                        o.ref_prev_hit_startpos = h.ref_start;
-                        o.n_hits ++;
-                        //                        o.score += (float)1/ (float)h.count;
-                        is_added = true;
-                        break;
-                    }
-                }
-
-            }
-#ifdef use_my_time
-            t3_2 += clock64() - t_start1;
-#endif
-
-            // Add the hit to open matches
-            if (!is_added){
-#ifdef use_my_time
-                t_start1 = clock64();
-#endif
-                Nam n;
-                n.query_start = h.query_start;
-                n.query_end = h.query_end;
-                n.ref_start = h.ref_start;
-                n.ref_end = h.ref_end;
-                n.ref_id = ref_id;
-                //                n.previous_query_start = h.query_s;
-                //                n.previous_ref_start = h.ref_s;
-                n.query_prev_hit_startpos = h.query_start;
-                n.ref_prev_hit_startpos = h.ref_start;
-                n.n_hits = 1;
-                n.is_rc = is_revcomp;
-                //                n.score += (float)1 / (float)h.count;
-                open_nams.push_back(n);
-#ifdef use_my_time
-                t3_3 += clock64() - t_start1;
-#endif
-            }
-
-            // Only filter if we have advanced at least k nucleotides
-            if (h.query_start > prev_q_start + k) {
-
-#ifdef use_my_time
-                t_start1 = clock64();
-#endif
-                // Output all NAMs from open_matches to final_nams that the current hit have passed
-                for (int k = 0; k < open_nams.size(); k++) {
-                    Nam& n = open_nams[k];
-                    if (n.query_end < h.query_start) {
-                        int n_max_span = my_max(n.query_span(), n.ref_span());
-                        int n_min_span = my_min(n.query_span(), n.ref_span());
-                        float n_score;
-                        n_score = ( 2*n_min_span -  n_max_span) > 0 ? (float) (n.n_hits * ( 2*n_min_span -  n_max_span) ) : 1;   // this is really just n_hits * ( min_span - (offset_in_span) ) );
-                        //                        n_score = n.n_hits * n.query_span();
-                        n.score = n_score;
-                        n.nam_id = nams.size();
-                        nams.push_back(n);
-                    }
-                }
-
-                // Remove all NAMs from open_matches that the current hit have passed
-                auto c = h.query_start;
-                int old_open_size = open_nams.size();
-                open_nams.clear();
-                for (int in = 0; in < old_open_size; ++in) {
-                    if (!(open_nams[in].query_end < c)) {
-                        open_nams.push_back(open_nams[in]);
-                    }
-                }
-                prev_q_start = h.query_start;
-#ifdef use_my_time
-                t3_4 += clock64() - t_start1;
-#endif
-            }
-        }
-
-#ifdef use_my_time
-        t_start1 = clock64();
-#endif
-        // Add all current open_matches to final NAMs
-        for (int k = 0; k < open_nams.size(); k++) {
-            Nam& n = open_nams[k];
-            int n_max_span = my_max(n.query_span(), n.ref_span());
-            int n_min_span = my_min(n.query_span(), n.ref_span());
-            float n_score;
-            n_score = ( 2*n_min_span -  n_max_span) > 0 ? (float) (n.n_hits * ( 2*n_min_span -  n_max_span) ) : 1;   // this is really just n_hits * ( min_span - (offset_in_span) ) );
-            //            n_score = n.n_hits * n.query_span();
-            n.score = n_score;
-            n.nam_id = nams.size();
-            nams.push_back(n);
-        }
-#ifdef use_my_time
-        t3_5 += clock64() - t_start1;
-#endif
-
-    }
-    for(int i = 0; i < mx_ref_id; i++) {
-        if(ref_id_table[i] != nullptr) {
-            delete ref_id_table[i];
-        }
-    }
-#ifdef use_my_time
-    t3 += clock64() - t_start;
-#endif
-
-}
-
-__device__ void fast_merge_hits_into_nams(
-        my_vector<Hit>* tot_ref_id_table[],
-        int k,
-        bool sort,
-        bool is_revcomp,
-        my_vector<Nam>& nams,
-        MemoryManagerType* mm,
-        unsigned long long &t1,
-        unsigned long long &t2,
-        unsigned long long &t3,
-        unsigned long long &t3_1,
-        unsigned long long &t3_2,
-        unsigned long long &t3_3,
-        unsigned long long &t3_4,
-        unsigned long long &t3_5,
-        int tid
-) {
-
-    int tot_hit_num = 0;
-    for(int i = 0; i < mx_ref_id; i++) {
-        if(tot_ref_id_table[i] != nullptr) {
-            tot_hit_num += tot_ref_id_table[i]->size();
-        }
-    }
-    if(tot_hit_num == 0) return;
-//    if(hits_per_ref_size == 0) return;
-
-    unsigned long long t_start;
-#ifdef use_my_time
-    t_start = clock64();
-#endif
-
-#ifdef use_my_time
-    t1 += clock64() - t_start;
-#endif
-    if(tid == 0 && blockIdx.x % 1000 == 0) {
-        for(int i = 0; i < mx_ref_id; i++) {
-            if(tot_ref_id_table[i] != nullptr) {
-                printf("ref_id %d size %d; ", i, tot_ref_id_table[i]->size());
-            }
-        }
-        printf("\ntot_hit_num %d\n\n\n", tot_hit_num);
-    }
-#ifdef use_my_time
-    t_start = clock64();
-#endif
-
-#ifdef use_my_time
-    t2 += clock64() - t_start;
-#endif
-
-    my_vector<Nam> open_nams(mm);
-
-#ifdef use_my_time
-    t_start = clock64();
-#endif
-    int pre_ref_num = ceil(1.0 * mx_ref_id / 32);
-    int l_ref_id = tid * pre_ref_num;
-    int r_ref_id = my_min((tid + 1) * pre_ref_num, mx_ref_id);
-    for (int i = l_ref_id; i < r_ref_id; i++) {
-        if(tot_ref_id_table[i] == nullptr) continue;
-
-        unsigned long long t_start1;
-#ifdef use_my_time
-        t_start1 = clock64();
-#endif
-        int ref_id = i;
-        my_vector<Hit>& hits = *tot_ref_id_table[i];
-        if (sort) {
-//            std::sort(hits.begin(), hits.end());
-            quick_sort(&(hits[0]), hits.size(), mm);
-        }
-        open_nams.clear();
-        unsigned int prev_q_start = 0;
-#ifdef use_my_time
-        t3_1 += clock64() - t_start1;
-#endif
-
-        for (int j = 0; j < hits.size(); j++) {
-#ifdef use_my_time
-            t_start1 = clock64();
-#endif
-            Hit& h = hits[j];
+            Hit& h = hits_per_ref[now_vec_pos + j].second;
             bool is_added = false;
             for (int k = 0; k < open_nams.size(); k++) {
                 Nam& o = open_nams[k];
@@ -938,8 +815,8 @@ __device__ void merge_hits_into_nams_forward_and_reverse(
 
 __device__ void fast_merge_hits_into_nams_forward_and_reverse(
         my_vector<Nam>& nams,
-        my_vector<Hit>* tot_ref_id_table0[],
-        my_vector<Hit>* tot_ref_id_table1[],
+        my_vector<my_pair<int, Hit>>& hits_per_ref0,
+        my_vector<my_pair<int, Hit>>& hits_per_ref1,
         int k,
         bool sort,
         MemoryManagerType* mm,
@@ -951,61 +828,10 @@ __device__ void fast_merge_hits_into_nams_forward_and_reverse(
         unsigned long long &t3_3,
         unsigned long long &t3_4,
         unsigned long long &t3_5,
-        int tid
+        int btid
 ) {
-    fast_merge_hits_into_nams(tot_ref_id_table0, k, sort, 0, nams, mm,
-                              t1, t2, t3, t3_1, t3_2, t3_3, t3_4, t3_5, tid);
-    fast_merge_hits_into_nams(tot_ref_id_table1, k, sort, 1, nams, mm,
-                              t1, t2, t3, t3_1, t3_2, t3_3, t3_4, t3_5, tid);
-}
-
-__device__ void fast_add_to_hits_per_ref(
-        my_vector<Hit>* tot_ref_id_table[],
-        int query_start,
-        int query_end,
-        size_t position,
-        const RefRandstrobe *d_randstrobes,
-        size_t d_randstrobes_size,
-        int k
-) {
-    int min_diff = 1 << 30;
-    for (const auto hash = gpu_get_hash(d_randstrobes, d_randstrobes_size, position); gpu_get_hash(d_randstrobes, d_randstrobes_size, position) == hash; ++position) {
-        int ref_start = d_randstrobes[position].position;
-        int ref_end = ref_start + d_randstrobes[position].strobe2_offset() + k;
-        int diff = std::abs((query_end - query_start) - (ref_end - ref_start));
-        if (diff <= min_diff) {
-            int ref_id = d_randstrobes[position].reference_index();
-            if(tot_ref_id_table[ref_id] == nullptr) {
-                tot_ref_id_table[ref_id] = new my_vector<Hit>(nullptr);
-            }
-            tot_ref_id_table[ref_id]->push_back(Hit{query_start, query_end, ref_start, ref_end});
-            min_diff = diff;
-        }
-    }
-}
-
-__device__ void old_fast_add_to_hits_per_ref(
-        my_pair<int, Hit> hits_per_ref[],
-        int *hits_per_ref_size,
-        int query_start,
-        int query_end,
-        size_t position,
-        const RefRandstrobe *d_randstrobes,
-        size_t d_randstrobes_size,
-        int k
-) {
-    int min_diff = 1 << 30;
-    for (const auto hash = gpu_get_hash(d_randstrobes, d_randstrobes_size, position); gpu_get_hash(d_randstrobes, d_randstrobes_size, position) == hash; ++position) {
-        int ref_start = d_randstrobes[position].position;
-        int ref_end = ref_start + d_randstrobes[position].strobe2_offset() + k;
-        int diff = std::abs((query_end - query_start) - (ref_end - ref_start));
-        if (diff <= min_diff) {
-            hits_per_ref[*hits_per_ref_size] = {d_randstrobes[position].reference_index(), Hit{query_start, query_end, ref_start, ref_end}};
-            *hits_per_ref_size += 1;
-//            hits_per_ref.push_back({d_randstrobes[position].reference_index(), Hit{query_start, query_end, ref_start, ref_end}});
-            min_diff = diff;
-        }
-    }
+    fast_merge_hits_into_nams(hits_per_ref0, k, sort, 0, nams, mm, t1, t2, t3, t3_1, t3_2, t3_3, t3_4, t3_5, btid);
+    fast_merge_hits_into_nams(hits_per_ref1, k, sort, 1, nams, mm, t1, t2, t3, t3_1, t3_2, t3_3, t3_4, t3_5, btid);
 }
 
 __device__ void add_to_hits_per_ref(
@@ -1024,12 +850,6 @@ __device__ void add_to_hits_per_ref(
         int ref_end = ref_start + d_randstrobes[position].strobe2_offset() + k;
         int diff = std::abs((query_end - query_start) - (ref_end - ref_start));
         if (diff <= min_diff) {
-//            int red_id = d_randstrobes[position].reference_index();
-//            int hash_id = get_or_insert_ref(hash_table, hash_node_num, red_id);
-//            if(hits_per_ref[hash_id] == nullptr) {
-//                hits_per_ref[hash_id] = new my_vector<my_pair<int, Hit>>(mm);
-//            }
-//            hits_per_ref[hash_id]->push_back({red_id, Hit{query_start, query_end, ref_start, ref_end}});
             hits_per_ref.push_back({d_randstrobes[position].reference_index(), Hit{query_start, query_end, ref_start, ref_end}});
             min_diff = diff;
         }
@@ -1068,6 +888,8 @@ __global__ void gpu_step3_fast(
     int b_tid = blockIdx.x;
     int wrap_thread_id = threadIdx.x;
 
+//    if(b_tid > 100) return;
+
     int l_range = b_tid * GPU_read_block_size;
     int r_range = l_range + GPU_read_block_size;
     if (r_range > num_reads) r_range = num_reads;
@@ -1091,6 +913,7 @@ __global__ void gpu_step3_fast(
     unsigned long long t_time4_3_5 = 0;
 
     long long hts_num = 0;
+    long long nams_num = 0;
 
     int tot_seeds_num = 0;
 
@@ -1105,6 +928,15 @@ __global__ void gpu_step3_fast(
         int rtid = rescue_seeds[tid].read_id;
         int rv = rescue_seeds[tid].read_fr;
 
+        __shared__ my_vector<my_pair<int, Hit>>* hits_per_ref0;
+        __shared__ my_vector<my_pair<int, Hit>>* hits_per_ref1;
+
+        if (wrap_thread_id == 0) {
+            hits_per_ref0 = new my_vector<my_pair<int, Hit>>(mm);
+            hits_per_ref1 = new my_vector<my_pair<int, Hit>>(mm);
+        }
+        __syncthreads();
+
         if(wrap_thread_id == 0) {
 #ifdef use_my_time
             t_start1 = clock64();
@@ -1112,10 +944,6 @@ __global__ void gpu_step3_fast(
 
             my_vector<RescueHit> hits_t0(mm);
             my_vector<RescueHit> hits_t1(mm);
-            for(int i = 0; i < mx_ref_id; i++) {
-                tot_ref_id_table0[i] = nullptr;
-                tot_ref_id_table1[i] = nullptr;
-            }
 
             tot_seeds_num += rescue_seeds[tid].seeds_num;
 #ifdef use_my_time
@@ -1153,7 +981,7 @@ __global__ void gpu_step3_fast(
                 if ((rh.count > rescue_cutoff && cnt >= 5) || rh.count > rescue_threshold) {
                     break;
                 }
-                fast_add_to_hits_per_ref(tot_ref_id_table0, rh.query_start, rh.query_end, rh.position, d_randstrobes, d_randstrobes_size, index_para->syncmer.k);
+                add_to_hits_per_ref(*hits_per_ref0, rh.query_start, rh.query_end, rh.position, d_randstrobes, d_randstrobes_size, index_para->syncmer.k);
                 cnt++;
             }
             quick_sort(&(hits_t1[0]), hits_t1.size(), mm);
@@ -1163,11 +991,11 @@ __global__ void gpu_step3_fast(
                 if ((rh.count > rescue_cutoff && cnt >= 5) || rh.count > rescue_threshold) {
                     break;
                 }
-                fast_add_to_hits_per_ref(tot_ref_id_table1, rh.query_start, rh.query_end, rh.position, d_randstrobes, d_randstrobes_size, index_para->syncmer.k);
+                add_to_hits_per_ref(*hits_per_ref1, rh.query_start, rh.query_end, rh.position, d_randstrobes, d_randstrobes_size, index_para->syncmer.k);
                 cnt++;
             }
 
-//            hts_num += f0_size + f1_size;
+            hts_num += hits_per_ref0->size() + hits_per_ref1->size();
 #ifdef use_my_time
             t_time3 += clock64() - t_start1;
 #endif
@@ -1179,7 +1007,7 @@ __global__ void gpu_step3_fast(
         t_start1 = clock64();
 #endif
         my_vector<Nam> nams(mm);
-        fast_merge_hits_into_nams_forward_and_reverse(nams, tot_ref_id_table0, tot_ref_id_table1, index_para->syncmer.k, true, mm, t_time4_1, t_time4_2, t_time4_3,
+        fast_merge_hits_into_nams_forward_and_reverse(nams, *hits_per_ref0, *hits_per_ref1, index_para->syncmer.k, true, mm, t_time4_1, t_time4_2, t_time4_3,
                                                       t_time4_3_1, t_time4_3_2, t_time4_3_3, t_time4_3_4, t_time4_3_5, wrap_thread_id);
 #ifdef use_my_time
         t_time4 += clock64() - t_start1;
@@ -1187,28 +1015,29 @@ __global__ void gpu_step3_fast(
 #endif
 
         __syncthreads();
-        if(wrap_thread_id == 0) {
-            for (int i = 0; i < mx_ref_id; i++) {
-                if (tot_ref_id_table0[i] != nullptr) {
-                    delete tot_ref_id_table0[i];
-                }
-                if (tot_ref_id_table1[i] != nullptr) {
-                    delete tot_ref_id_table1[i];
-                }
-            }
+
+        if (wrap_thread_id == 0) {
+            uint64_t local_total_hits = 0;
+            uint64_t local_nr_good_hits = 0;
+            if (hits_per_ref0->size() > MAX_HITS) local_total_hits += hits_per_ref0->size();
+            else local_nr_good_hits += hits_per_ref0->size();
+            if (hits_per_ref1->size() > MAX_HITS) local_total_hits += hits_per_ref1->size();
+            else local_nr_good_hits += hits_per_ref1->size();
+
+            nams_num += nams.size();
+
+//            for (int i = 0; i < nams.size(); i++) {
+//                local_total_hits += nams[i].ref_id + nams[i].ref_start + nams[i].ref_end;
+//                local_nr_good_hits += int(nams[i].score) + nams[i].query_start + nams[i].query_end;
+//            }
+            global_nr_good_hits[rtid] += local_nr_good_hits;
+            global_total_hits[rtid] += local_total_hits;
+            delete hits_per_ref0;
+            delete hits_per_ref1;
         }
-        uint64_t local_total_hits = 0;
-        uint64_t local_nr_good_hits = 0;
-//            local_nr_good_hits += hits_per_ref0.size();
-//            local_nr_good_hits += hits_per_ref1.size();
-        for (int i = 0; i < nams.size(); i++) {
-            local_total_hits += nams[i].ref_id + nams[i].ref_start + nams[i].ref_end;
-            local_nr_good_hits += int(nams[i].score) + nams[i].query_start + nams[i].query_end;
-        }
-        global_nr_good_hits[rtid] += local_nr_good_hits;
-        global_total_hits[rtid] += local_total_hits;
-//        atomicAdd(reinterpret_cast<unsigned long long *>(&global_total_hits[rtid]), static_cast<unsigned long long>(local_total_hits));
-//        atomicAdd(reinterpret_cast<unsigned long long *>(&global_nr_good_hits[rtid]), static_cast<unsigned long long>(local_nr_good_hits));
+
+//        assert(wrap_thread_id == 0);
+
 
 
 #ifdef use_my_time
@@ -1219,8 +1048,8 @@ __global__ void gpu_step3_fast(
     t_time_tot += clock64() - t_start;
     if(b_tid % 100 == 0 && wrap_thread_id == 0) {
         // printf all time info
-        printf("time3 %d %llu, %.3f : %.3f %.3f ( %.3f %.3f ) %.3f %.3f ( %.3f %.3f %.3f [ %.3f %.3f %.3f %.3f %.3f ]) %.3f\n",
-               tot_seeds_num,
+        printf("time3 %-10lld %-10lld %-10.3f : %-10.3f %-10.3f ( %-10.3f %-10.3f ) %-10.3f %-10.3f ( %-10.3f %-10.3f %-10.3f [ %-10.3f %-10.3f %-10.3f %-10.3f %-10.3f ]) %-10.3f\n",
+               nams_num,
                hts_num,
                t_time_tot / 1e6,
                t_time1 / 1e6,
@@ -1239,6 +1068,7 @@ __global__ void gpu_step3_fast(
                t_time4_3_5 / 1e6,
                t_time5 / 1e6
         );
+
     }
 #endif
 }
@@ -1641,11 +1471,25 @@ __global__ void gpu_step12(
 #ifdef use_my_time
     if(b_tid % 100 == 0) {
  //        acquire_lock();
-         printf("btid %d, time12 %.3f %.3f %.3f %.3f %.3f ( %.3f %.3f %.3f [ %.3f %.3f %.3f %.3f %.3f ] ) %.3f\n",
-                b_tid, t_time_tot / 1e6, t_time1 / 1e6, t_time2 / 1e6, t_time3 / 1e6, t_time4 / 1e6, t_time4_1 / 1e6, t_time4_2 / 1e6,
-                t_time4_3 / 1e6, t_time4_3_1 / 1e6, t_time4_3_2 / 1e6, t_time4_3_3 / 1e6, t_time4_3_4 / 1e6, t_time4_3_5 / 1e6,
-                t_time5 / 1e6);
- //        release_lock();
+        printf("btid %-10d time12 %-10.3f %-10.3f %-10.3f %-10.3f %-10.3f ( %-10.3f %-10.3f %-10.3f [ %-10.3f %-10.3f %-10.3f %-10.3f %-10.3f ] ) %-10.3f\n",
+               b_tid,
+               t_time_tot / 1e6,
+               t_time1 / 1e6,
+               t_time2 / 1e6,
+               t_time3 / 1e6,
+               t_time4 / 1e6,
+               t_time4_1 / 1e6,
+               t_time4_2 / 1e6,
+               t_time4_3 / 1e6,
+               t_time4_3_1 / 1e6,
+               t_time4_3_2 / 1e6,
+               t_time4_3_3 / 1e6,
+               t_time4_3_4 / 1e6,
+               t_time4_3_5 / 1e6,
+               t_time5 / 1e6
+        );
+
+        //        release_lock();
      }
 #endif
 
@@ -1770,7 +1614,7 @@ int main(int argc, char **argv) {
                  index.randstrobe_start_indices.size() * sizeof(my_bucket_index_t) << std::endl;
 
 
-#define batch_size 20000ll
+#define batch_size 200000ll
 #define batch_seq_szie batch_size * 250ll
 
     size_t instantitation_size = 8ll * 1024ll * 1024ll;
