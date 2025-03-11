@@ -8,7 +8,13 @@ __device__ void* my_malloc(size_t size, MemoryManagerType* mm) {
 //        printf("Error: mm is nullptr in my_malloc!\n");
 //        return nullptr;
 //    }
+//    if(size < 128)  size = 128;
+//    if(size > 65536) {
+//        printf("size is too large %d\n", size);
+////        assert(false);
+//    }
     void* ptr = gallatin::allocators::global_malloc(size);
+//    printf("malloc -- %llu\n", size);
 //    void* ptr = global_malloc(size);
 //    void* ptr = mm->malloc(size);
 //    void* ptr = malloc(size);
@@ -50,4 +56,8 @@ __host__ void init_mm(uint64_t num_bytes, uint64_t seed) {
 
 __host__ void free_mm() {
     gallatin::allocators::free_global_allocator();
+}
+
+__host__ void print_mm() {
+    gallatin::allocators::print_global_stats();
 }

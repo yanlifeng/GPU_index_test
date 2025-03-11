@@ -53,11 +53,12 @@ struct RescueHit {
 //    gallatin::allocators::global_free(ptr);
 //}
 
-__device__ void* my_malloc(size_t size, MemoryManagerType* mm);
-__device__ void my_free(void* ptr, MemoryManagerType* mm);
+__device__ void* my_malloc(size_t size, MemoryManagerType* mm = nullptr);
+__device__ void my_free(void* ptr, MemoryManagerType* mm = nullptr);
 
 __host__ void init_mm(uint64_t num_bytes, uint64_t seed);
 __host__ void free_mm();
+__host__ void print_mm();
 
 template <typename T>
 struct my_vector {
@@ -157,8 +158,8 @@ struct my_pair {
     T1 first;
     T2 second;
 
-    __device__ my_pair() : first(T1()), second(T2()) {}
-    __device__ my_pair(const T1& a, const T2& b) : first(a), second(b) {}
+//    __device__ my_pair() : first(T1()), second(T2()) {}
+//    __device__ my_pair(const T1& a, const T2& b) : first(a), second(b) {}
 
     __device__ bool operator<(const my_pair& other) const {
         if (first < other.first) return true;
