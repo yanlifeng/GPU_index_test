@@ -67,10 +67,17 @@ struct my_vector {
     int capacity;
     MemoryManagerType* mm_pool;
 
-//    __device__ my_vector() : data(nullptr), length(0), capacity(0), mm_pool(nullptr) {
-//    }
+    __host__ my_vector() : data(nullptr), length(0), capacity(0), mm_pool(nullptr) {
+    }
 
     __device__ my_vector(MemoryManagerType* mm_, int N = 4) {
+        mm_pool = mm_;
+        capacity = N;
+        length = 0;
+        data = (T*)my_malloc(capacity * sizeof(T), mm_pool);
+    }
+
+    __device__ void init(MemoryManagerType* mm_, int N = 4) {
         mm_pool = mm_;
         capacity = N;
         length = 0;

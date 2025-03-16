@@ -275,7 +275,7 @@ __device__ void quick_sort(T* data, int size, MemoryManagerType* mm) {
 
 }
 
-#define use_my_time
+//#define use_my_time
 
 const int mx_ref_id = 2800;
 
@@ -507,6 +507,263 @@ __device__ void merge_hits_into_nams(
 #define MAX_HITS 2048
 #define BLOCK_SIZE 32
 
+
+__device__ void sort_hits(
+        my_vector<my_pair<int, Hit>>& hits_per_ref,
+        int k,
+        bool is_revcomp,
+        int tid
+) {
+    if(hits_per_ref.size() == 0) return;
+    int num_hits = hits_per_ref.size();
+
+//    if(tid == 0) quick_sort(&(hits_per_ref[0]), num_hits, nullptr);
+
+
+    const int items_per_thread = 160;
+    int real_num_hits = items_per_thread * BLOCK_SIZE;
+    if(real_num_hits < num_hits) {
+        printf("real_num_hits %d num_hits %d\n", real_num_hits, num_hits);
+    }
+    assert(real_num_hits >= num_hits);
+
+    typedef cub::BlockRadixSort<unsigned long long, BLOCK_SIZE, items_per_thread, int> BlockRadixSort;
+    __shared__ typename BlockRadixSort::TempStorage temp_storage;
+
+    unsigned long long thread_keys[items_per_thread];
+    int thread_indices[items_per_thread];
+
+    __shared__ int* old_ref_end;
+    __shared__ int* old_query_end;
+    if(tid == 0) {
+        old_ref_end = (int*)my_malloc(real_num_hits * sizeof(int), nullptr);
+        old_query_end = (int*)my_malloc(real_num_hits * sizeof(int), nullptr);
+    }
+    __syncthreads();
+
+    for (int i = 0; i < items_per_thread; ++i) {
+        int idx = tid * items_per_thread + i;
+        if (idx < num_hits) {
+            thread_keys[i] = (static_cast<unsigned long long>(hits_per_ref[idx].first) << 48) |
+                             (static_cast<unsigned long long>(hits_per_ref[idx].second.query_start & 0xFFFF) << 32) |
+                             (static_cast<unsigned long long>(hits_per_ref[idx].second.ref_start) & 0xFFFFFFFF);
+            thread_indices[i] = idx;
+            old_ref_end[idx] = hits_per_ref[idx].second.ref_end;
+            old_query_end[idx] = hits_per_ref[idx].second.query_end;
+        } else {
+            thread_keys[i] = ULLONG_MAX;
+            thread_indices[i] = -1;
+            old_ref_end[idx] = 0;
+            old_query_end[idx] = 0;
+        }
+    }
+    __syncthreads();
+
+    BlockRadixSort(temp_storage).Sort(thread_keys, thread_indices);
+    __syncthreads();
+
+    for (int i = 0; i < items_per_thread; ++i) {
+        int idx = tid * items_per_thread + i;
+        if (idx < num_hits) {
+            hits_per_ref[idx].first = thread_keys[i] >> 48;
+            hits_per_ref[idx].second.query_start = (thread_keys[i] >> 32) & 0xFFFF;
+            hits_per_ref[idx].second.ref_start = thread_keys[i] & 0xFFFFFFFF;
+            hits_per_ref[idx].second.ref_end = old_ref_end[thread_indices[i]];
+            hits_per_ref[idx].second.query_end = old_query_end[thread_indices[i]];
+        }
+    }
+    __syncthreads();
+    if(tid == 0) {
+        my_free(old_ref_end, nullptr);
+        my_free(old_query_end, nullptr);
+    }
+
+}
+
+__device__ void merge_hits(
+        my_vector<my_pair<int, Hit>>& hits_per_ref,
+        int k,
+        bool is_revcomp,
+        my_vector<Nam>& nams,
+        int tid
+) {
+    if(hits_per_ref.size() == 0) return;
+    unsigned long long t_start;
+    int num_hits = hits_per_ref.size();
+
+#ifdef use_my_time
+    t_start = clock64();
+#endif
+    int ref_num = 0;
+    my_vector<int> each_ref_size(nullptr);
+    int pre_ref_id = hits_per_ref[0].first;
+    int now_ref_num = 1;
+    for(int i = 1; i < hits_per_ref.size(); i++) {
+        int ref_id = hits_per_ref[i].first;
+        Hit hit = hits_per_ref[i].second;
+        if(ref_id != pre_ref_id) {
+            ref_num++;
+            pre_ref_id = ref_id;
+            each_ref_size.push_back(now_ref_num);
+            now_ref_num = 1;
+        } else {
+            now_ref_num++;
+        }
+    }
+    ref_num++;
+    each_ref_size.push_back(now_ref_num);
+//    printf("ref_num is %d\n", ref_num);
+#ifdef use_my_time
+    t2 += clock64() - t_start;
+#endif
+
+
+    my_vector<Nam> open_nams(nullptr);
+
+#ifdef use_my_time
+    t_start = clock64();
+#endif
+    int now_vec_pos = 0;
+    for (int i = 0; i < ref_num; i++) {
+
+        unsigned long long t_start1;
+#ifdef use_my_time
+        t_start1 = clock64();
+#endif
+        if(i != 0) now_vec_pos += each_ref_size[i - 1];
+        int ref_id = hits_per_ref[now_vec_pos].first;
+        open_nams.clear();
+        unsigned int prev_q_start = 0;
+#ifdef use_my_time
+        t3_1 += clock64() - t_start1;
+#endif
+
+        for (int j = 0; j < each_ref_size[i]; j++) {
+#ifdef use_my_time
+            t_start1 = clock64();
+#endif
+            Hit& h = hits_per_ref[now_vec_pos + j].second;
+            bool is_added = false;
+            for (int k = 0; k < open_nams.size(); k++) {
+                Nam& o = open_nams[k];
+
+                // Extend NAM
+                if ((o.query_prev_hit_startpos < h.query_start) && (h.query_start <= o.query_end ) && (o.ref_prev_hit_startpos < h.ref_start) && (h.ref_start <= o.ref_end) ){
+                    if ( (h.query_end > o.query_end) && (h.ref_end > o.ref_end) ) {
+                        o.query_end = h.query_end;
+                        o.ref_end = h.ref_end;
+                        //                        o.previous_query_start = h.query_s;
+                        //                        o.previous_ref_start = h.ref_s; // keeping track so that we don't . Can be caused by interleaved repeats.
+                        o.query_prev_hit_startpos = h.query_start;
+                        o.ref_prev_hit_startpos = h.ref_start;
+                        o.n_hits ++;
+                        //                        o.score += (float)1/ (float)h.count;
+                        is_added = true;
+                        break;
+                    }
+                    else if ((h.query_end <= o.query_end) && (h.ref_end <= o.ref_end)) {
+                        //                        o.previous_query_start = h.query_s;
+                        //                        o.previous_ref_start = h.ref_s; // keeping track so that we don't . Can be caused by interleaved repeats.
+                        o.query_prev_hit_startpos = h.query_start;
+                        o.ref_prev_hit_startpos = h.ref_start;
+                        o.n_hits ++;
+                        //                        o.score += (float)1/ (float)h.count;
+                        is_added = true;
+                        break;
+                    }
+                }
+
+            }
+#ifdef use_my_time
+            t3_2 += clock64() - t_start1;
+#endif
+
+            // Add the hit to open matches
+            if (!is_added){
+#ifdef use_my_time
+                t_start1 = clock64();
+#endif
+                Nam n;
+                n.query_start = h.query_start;
+                n.query_end = h.query_end;
+                n.ref_start = h.ref_start;
+                n.ref_end = h.ref_end;
+                n.ref_id = ref_id;
+                //                n.previous_query_start = h.query_s;
+                //                n.previous_ref_start = h.ref_s;
+                n.query_prev_hit_startpos = h.query_start;
+                n.ref_prev_hit_startpos = h.ref_start;
+                n.n_hits = 1;
+                n.is_rc = is_revcomp;
+                //                n.score += (float)1 / (float)h.count;
+                open_nams.push_back(n);
+#ifdef use_my_time
+                t3_3 += clock64() - t_start1;
+#endif
+            }
+
+            // Only filter if we have advanced at least k nucleotides
+            if (h.query_start > prev_q_start + k) {
+
+#ifdef use_my_time
+                t_start1 = clock64();
+#endif
+                // Output all NAMs from open_matches to final_nams that the current hit have passed
+                for (int k = 0; k < open_nams.size(); k++) {
+                    Nam& n = open_nams[k];
+                    if (n.query_end < h.query_start) {
+                        int n_max_span = my_max(n.query_span(), n.ref_span());
+                        int n_min_span = my_min(n.query_span(), n.ref_span());
+                        float n_score;
+                        n_score = ( 2*n_min_span -  n_max_span) > 0 ? (float) (n.n_hits * ( 2*n_min_span -  n_max_span) ) : 1;   // this is really just n_hits * ( min_span - (offset_in_span) ) );
+                        //                        n_score = n.n_hits * n.query_span();
+                        n.score = n_score;
+                        n.nam_id = nams.size();
+                        nams.push_back(n);
+                    }
+                }
+
+                // Remove all NAMs from open_matches that the current hit have passed
+                auto c = h.query_start;
+                int old_open_size = open_nams.size();
+                open_nams.clear();
+                for (int in = 0; in < old_open_size; ++in) {
+                    if (!(open_nams[in].query_end < c)) {
+                        open_nams.push_back(open_nams[in]);
+                    }
+                }
+                prev_q_start = h.query_start;
+#ifdef use_my_time
+                t3_4 += clock64() - t_start1;
+#endif
+            }
+        }
+
+#ifdef use_my_time
+        t_start1 = clock64();
+#endif
+        // Add all current open_matches to final NAMs
+        for (int k = 0; k < open_nams.size(); k++) {
+            Nam& n = open_nams[k];
+            int n_max_span = my_max(n.query_span(), n.ref_span());
+            int n_min_span = my_min(n.query_span(), n.ref_span());
+            float n_score;
+            n_score = ( 2*n_min_span -  n_max_span) > 0 ? (float) (n.n_hits * ( 2*n_min_span -  n_max_span) ) : 1;   // this is really just n_hits * ( min_span - (offset_in_span) ) );
+            //            n_score = n.n_hits * n.query_span();
+            n.score = n_score;
+            n.nam_id = nams.size();
+            nams.push_back(n);
+        }
+#ifdef use_my_time
+        t3_5 += clock64() - t_start1;
+#endif
+
+    }
+#ifdef use_my_time
+    t3 += clock64() - t_start;
+#endif
+
+}
 
 __device__ void fast_merge_hits_into_nams(
         my_vector<my_pair<int, Hit>>& hits_per_ref,
@@ -849,6 +1106,179 @@ __device__ void release_lock() {
 }
 
 #define GPU_read_thread_size 1
+
+__global__ void gpu_step3_fast1(
+        int bits,
+        unsigned int filter_cutoff,
+        int rescue_cutoff,
+        const RefRandstrobe *d_randstrobes,
+        size_t d_randstrobes_size,
+        const my_bucket_index_t *d_randstrobe_start_indices,
+        int num_reads,
+        IndexParameters *index_para,
+        int *randstrobe_sizes,
+        uint64_t *hashes,
+        MemoryManagerType* mm,
+        uint64_t *global_total_hits,
+        uint64_t *global_nr_good_hits,
+        Rescue_Seeds *rescue_seeds,
+        uint64_t** timer_start,
+        uint64_t** timer_end,
+        my_vector<my_pair<int, Hit>>* hits_per_ref0s,
+        my_vector<my_pair<int, Hit>>* hits_per_ref1s
+)
+{
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+
+    int l_range = bid * GPU_read_thread_size;
+    int r_range = l_range + GPU_read_thread_size;
+    if (r_range > num_reads) r_range = num_reads;
+
+
+    for (int id = l_range; id < r_range; id++) {
+        int rtid = rescue_seeds[id].read_id;
+        int rv = rescue_seeds[id].read_fr;
+
+        my_vector<my_pair<int, Hit>>* hits_per_ref0;
+        my_vector<my_pair<int, Hit>>* hits_per_ref1;
+
+        hits_per_ref0 = (my_vector<my_pair<int, Hit>>*)malloc(sizeof(my_vector<my_pair<int, Hit>>));
+        hits_per_ref1 = (my_vector<my_pair<int, Hit>>*)malloc(sizeof(my_vector<my_pair<int, Hit>>));
+        if (!hits_per_ref0) {
+            printf("Error: hits_per_ref0 allocation failed!\n");
+        }
+        if (!hits_per_ref1) {
+            printf("Error: hits_per_ref1 allocation failed!\n");
+        }
+        hits_per_ref0->init(mm);
+        hits_per_ref1->init(mm);
+
+        my_vector<RescueHit> hits_t0(mm);
+        my_vector<RescueHit> hits_t1(mm);
+        for (int i = 0; i < rescue_seeds[id].seeds_num; i++) {
+            QueryRandstrobe q = rescue_seeds[id].seeds[i];
+            size_t position = gpu_find(d_randstrobes, d_randstrobe_start_indices, q.hash, bits);
+            if (position != static_cast<size_t>(-1)) {
+                unsigned int count = gpu_get_count(d_randstrobes, d_randstrobe_start_indices, position, bits);
+                RescueHit rh{position, count, q.start, q.end};
+                if(q.is_reverse) hits_t1.push_back(rh);
+                else hits_t0.push_back(rh);
+            }
+        }
+        quick_sort(&(hits_t0[0]), hits_t0.size(), mm);
+        int cnt = 0;
+        for (int i = 0; i < hits_t0.size(); i++) {
+            RescueHit &rh = hits_t0[i];
+            if ((rh.count > rescue_cutoff && cnt >= 5) || rh.count > rescue_threshold) {
+                break;
+            }
+            add_to_hits_per_ref(*hits_per_ref0, rh.query_start, rh.query_end, rh.position, d_randstrobes, d_randstrobes_size, index_para->syncmer.k);
+            cnt++;
+        }
+        quick_sort(&(hits_t1[0]), hits_t1.size(), mm);
+        cnt = 0;
+        for (int i = 0; i < hits_t1.size(); i++) {
+            RescueHit &rh = hits_t1[i];
+            if ((rh.count > rescue_cutoff && cnt >= 5) || rh.count > rescue_threshold) {
+                break;
+            }
+            add_to_hits_per_ref(*hits_per_ref1, rh.query_start, rh.query_end, rh.position, d_randstrobes, d_randstrobes_size, index_para->syncmer.k);
+            cnt++;
+        }
+        hits_per_ref0s[id] = *hits_per_ref0;
+        hits_per_ref1s[id] = *hits_per_ref1;
+        uint64_t local_total_hits = 0;
+        local_total_hits += hits_per_ref0->size() + hits_per_ref1->size();
+        global_total_hits[rtid * 2 + rv] += local_total_hits;
+        free(hits_per_ref0);
+        free(hits_per_ref1);
+
+//        hits_per_ref0s[id] = *hits_per_ref0;
+//        hits_per_ref1s[id] = *hits_per_ref1;
+    }
+}
+
+__global__ void gpu_step3_fast2(
+        int bits,
+        unsigned int filter_cutoff,
+        int rescue_cutoff,
+        const RefRandstrobe *d_randstrobes,
+        size_t d_randstrobes_size,
+        const my_bucket_index_t *d_randstrobe_start_indices,
+        int num_reads,
+        IndexParameters *index_para,
+        int *randstrobe_sizes,
+        uint64_t *hashes,
+        MemoryManagerType* mm,
+        uint64_t *global_total_hits,
+        uint64_t *global_nr_good_hits,
+        Rescue_Seeds *rescue_seeds,
+        uint64_t** timer_start,
+        uint64_t** timer_end,
+        my_vector<my_pair<int, Hit>>* hits_per_ref0s,
+        my_vector<my_pair<int, Hit>>* hits_per_ref1s
+)
+{
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+
+    int l_range = bid * GPU_read_thread_size;
+    int r_range = l_range + GPU_read_thread_size;
+    if (r_range > num_reads) r_range = num_reads;
+
+    for (int id = l_range; id < r_range; id++) {
+        int rtid = rescue_seeds[id].read_id;
+        int rv = rescue_seeds[id].read_fr;
+        sort_hits(hits_per_ref0s[id], index_para->syncmer.k, 0, tid);
+        sort_hits(hits_per_ref1s[id], index_para->syncmer.k, 1, tid);
+    }
+}
+
+__global__ void gpu_step3_fast3(
+        int bits,
+        unsigned int filter_cutoff,
+        int rescue_cutoff,
+        const RefRandstrobe *d_randstrobes,
+        size_t d_randstrobes_size,
+        const my_bucket_index_t *d_randstrobe_start_indices,
+        int num_reads,
+        IndexParameters *index_para,
+        int *randstrobe_sizes,
+        uint64_t *hashes,
+        MemoryManagerType* mm,
+        uint64_t *global_total_hits,
+        uint64_t *global_nr_good_hits,
+        Rescue_Seeds *rescue_seeds,
+        uint64_t** timer_start,
+        uint64_t** timer_end,
+        my_vector<my_pair<int, Hit>>* hits_per_ref0s,
+        my_vector<my_pair<int, Hit>>* hits_per_ref1s
+)
+{
+    int global_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+
+    int l_range = global_id * GPU_read_thread_size;
+    int r_range = l_range + GPU_read_thread_size;
+    if (r_range > num_reads) r_range = num_reads;
+
+    for (int id = l_range; id < r_range; id++) {
+        int rtid = rescue_seeds[id].read_id;
+        int rv = rescue_seeds[id].read_fr;
+        my_vector<Nam> nams(mm);
+        merge_hits(hits_per_ref0s[id], index_para->syncmer.k, 0, nams, tid);
+        merge_hits(hits_per_ref1s[id], index_para->syncmer.k, 1, nams, tid);
+        uint64_t local_nr_good_hits = 0;
+        for (int i = 0; i < nams.size(); i++) {
+            local_nr_good_hits += nams[i].ref_id + int(nams[i].score) + nams[i].query_start + nams[i].query_end;
+        }
+        global_nr_good_hits[rtid * 2 + rv] += local_nr_good_hits;
+        hits_per_ref0s[id].release();
+        hits_per_ref1s[id].release();
+    }
+}
 
 __global__ void gpu_step3_fast(
         int bits,
@@ -1499,6 +1929,12 @@ klibpp::KSeq ConvertNeo2KSeq(neoReference ref) {
     return res;
 }
 
+__global__ void init_my_vector(my_vector<my_pair<int, Hit>> *vecs, MemoryManagerType* mm) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    vecs[idx] = my_vector<my_pair<int, Hit>>(mm);
+}
+
+
 static Logger &logger = Logger::get();
 
 
@@ -1602,7 +2038,7 @@ int main(int argc, char **argv) {
 #define batch_seq_szie batch_size * 250ll
 
 
-    uint64_t num_bytes = 20ll * 1024ll * 1024ll * 1024ll; // 8GB
+    uint64_t num_bytes = 20ll * 1024ll * 1024ll * 1024ll;
     uint64_t seed = 13;
     init_mm(num_bytes, seed);
 
@@ -1613,27 +2049,38 @@ int main(int argc, char **argv) {
     uint64_t * a_hashes;
     cudaMallocManaged(&a_hashes, batch_size * sizeof(uint64_t));
 
-    uint64_t **timer_starts12;
-    cudaMallocManaged(&timer_starts12, 20 * sizeof(uint64_t*));
-    for(int i = 0; i < 20; i++) {
-        cudaMallocManaged(&(timer_starts12[i]), batch_size * sizeof(uint64_t));
-    }
-    uint64_t **timer_ends12;
-    cudaMallocManaged(&timer_ends12, 20 * sizeof(uint64_t*));
-    for(int i = 0; i < 20; i++) {
-        cudaMallocManaged(&(timer_ends12[i]), batch_size * sizeof(uint64_t));
-    }
+    my_vector<my_pair<int, Hit>> *global_hits_per_ref0s;
+    cudaMallocManaged(&global_hits_per_ref0s, batch_size * 2 * sizeof(my_vector<my_pair<int, Hit>>));
+    init_my_vector<<<batch_size * 2, 1>>>(global_hits_per_ref0s, nullptr);
+    cudaDeviceSynchronize();
 
+    my_vector<my_pair<int, Hit>> *global_hits_per_ref1s;
+    cudaMallocManaged(&global_hits_per_ref1s, batch_size * 2 * sizeof(my_vector<my_pair<int, Hit>>));
+    init_my_vector<<<batch_size * 2, 1>>>(global_hits_per_ref1s, nullptr);
+    cudaDeviceSynchronize();
+
+
+    uint64_t **timer_starts12;
+//    cudaMallocManaged(&timer_starts12, 20 * sizeof(uint64_t*));
+//    for(int i = 0; i < 20; i++) {
+//        cudaMallocManaged(&(timer_starts12[i]), batch_size * sizeof(uint64_t));
+//    }
+    uint64_t **timer_ends12;
+//    cudaMallocManaged(&timer_ends12, 20 * sizeof(uint64_t*));
+//    for(int i = 0; i < 20; i++) {
+//        cudaMallocManaged(&(timer_ends12[i]), batch_size * sizeof(uint64_t));
+//    }
+//
     uint64_t **timer_starts3;
-    cudaMallocManaged(&timer_starts3, 20 * sizeof(uint64_t*));
-    for(int i = 0; i < 20; i++) {
-        cudaMallocManaged(&(timer_starts3[i]), batch_size * 2 * sizeof(uint64_t));
-    }
+//    cudaMallocManaged(&timer_starts3, 20 * sizeof(uint64_t*));
+//    for(int i = 0; i < 20; i++) {
+//        cudaMallocManaged(&(timer_starts3[i]), batch_size * 2 * sizeof(uint64_t));
+//    }
     uint64_t **timer_ends3;
-    cudaMallocManaged(&timer_ends3, 20 * sizeof(uint64_t*));
-    for(int i = 0; i < 20; i++) {
-        cudaMallocManaged(&(timer_ends3[i]), batch_size * 2 * sizeof(uint64_t));
-    }
+//    cudaMallocManaged(&timer_ends3, 20 * sizeof(uint64_t*));
+//    for(int i = 0; i < 20; i++) {
+//        cudaMallocManaged(&(timer_ends3[i]), batch_size * 2 * sizeof(uint64_t));
+//    }
 
     t0 = GetTime();
     char *d_seq;
@@ -1672,6 +2119,8 @@ int main(int argc, char **argv) {
 
     double gpu_cost1 = 0;
     double gpu_cost2 = 0;
+    double gpu_cost3 = 0;
+    double gpu_cost4 = 0;
     double tot_cost = 0;
     size_t check_sum = 0;
     size_t size_tot = 0;
@@ -1748,13 +2197,13 @@ int main(int argc, char **argv) {
             a_global_nr_good_hits[i] = 0;
         }
 
-#pragma omp parallel for
-        for(int i = 0; i < 20; i++) {
-            for(int j = 0; j < s_len; j++) {
-                timer_starts12[i][j] = 0;
-                timer_ends12[i][j] = 0;
-            }
-        }
+//#pragma omp parallel for
+//        for(int i = 0; i < 20; i++) {
+//            for(int j = 0; j < s_len; j++) {
+//                timer_starts12[i][j] = 0;
+//                timer_ends12[i][j] = 0;
+//            }
+//        }
 
         for(int i = 0; i < s_len * 2; i++) {
             a_rescue_seeds[i].read_id = -1;
@@ -1778,22 +2227,22 @@ int main(int argc, char **argv) {
         cudaDeviceSynchronize();
         gpu_cost1 += GetTime() - t1;
 
-        double avg_time12[20];
-#pragma omp parallel for
-        for(int i = 0; i < 20; i++) {
-            avg_time12[i] = 0;
-            for(int j = 0; j < blocks_per_grid; j++) {
-//                avg_time12[i] += timer_ends12[i][j] - timer_starts12[i][j];
-                avg_time12[i] += timer_starts12[i][j] / 1e3;
-            }
-            avg_time12[i] /= blocks_per_grid;
-            tot_time12[i] += avg_time12[i];
-        }
-        printf("time12 -- %.3f : %.3f %.3f %.3f %.3f (%.3f %.3f %.3f [%.3f %.3f %.3f %.3f %.3f]) %.3f\n\n",
-               avg_time12[0], avg_time12[1], avg_time12[2], avg_time12[3], avg_time12[4],
-               avg_time12[5], avg_time12[6], avg_time12[7],
-               avg_time12[8], avg_time12[9], avg_time12[10], avg_time12[11], avg_time12[12],
-               avg_time12[13]);
+//        double avg_time12[20];
+//#pragma omp parallel for
+//        for(int i = 0; i < 20; i++) {
+//            avg_time12[i] = 0;
+//            for(int j = 0; j < blocks_per_grid; j++) {
+////                avg_time12[i] += timer_ends12[i][j] - timer_starts12[i][j];
+//                avg_time12[i] += timer_starts12[i][j] / 1e3;
+//            }
+//            avg_time12[i] /= blocks_per_grid;
+//            tot_time12[i] += avg_time12[i];
+//        }
+//        printf("time12 -- %.3f : %.3f %.3f %.3f %.3f (%.3f %.3f %.3f [%.3f %.3f %.3f %.3f %.3f]) %.3f\n\n",
+//               avg_time12[0], avg_time12[1], avg_time12[2], avg_time12[3], avg_time12[4],
+//               avg_time12[5], avg_time12[6], avg_time12[7],
+//               avg_time12[8], avg_time12[9], avg_time12[10], avg_time12[11], avg_time12[12],
+//               avg_time12[13]);
 
         for (size_t i = 0; i < s_len; ++i) {
             size_tot += a_randstrobe_sizes[i];
@@ -1827,90 +2276,124 @@ int main(int argc, char **argv) {
             a_global_nr_good_hits[i] = 0;
         }
 
-#pragma omp parallel for
-        for(int i = 0; i < 20; i++) {
-            for(int j = 0; j < s_len * 2; j++) {
-                timer_starts3[i][j] = 0;
-                timer_ends3[i][j] = 0;
-            }
-        }
+//#pragma omp parallel for
+//        for(int i = 0; i < 20; i++) {
+//            for(int j = 0; j < s_len * 2; j++) {
+//                timer_starts3[i][j] = 0;
+//                timer_ends3[i][j] = 0;
+//            }
+//        }
 
         int local_rescue_read_num = *a_rescue_read_num;
 
+        for(int i = 0; i < local_rescue_read_num; i++) {
+            global_hits_per_ref0s[i].data = nullptr;
+            global_hits_per_ref0s[i].length = 0;
+            global_hits_per_ref1s[i].data = nullptr;
+            global_hits_per_ref1s[i].length = 0;
+        }
+
         t1 = GetTime();
-        threads_per_block = 32;
-        reads_per_block = threads_per_block * GPU_read_thread_size;
-        blocks_per_grid = (local_rescue_read_num + reads_per_block - 1) / reads_per_block;
-//        gpu_step3<<<blocks_per_grid, threads_per_block>>>(index.bits, index.filter_cutoff, para_rescue_cutoff, d_randstrobes,
-        gpu_step3_fast<<<local_rescue_read_num, threads_per_block>>>(index.bits, index.filter_cutoff, para_rescue_cutoff, d_randstrobes,
-                index.randstrobes.size(), d_randstrobe_start_indices,
-                local_rescue_read_num,
-                d_index_para,
-                a_randstrobe_sizes, a_hashes, NULL, a_global_total_hits,
-                a_global_nr_good_hits,
-                a_rescue_seeds, timer_starts3, timer_ends3
-                );
+        gpu_step3_fast1<<<local_rescue_read_num, 1>>>(index.bits, index.filter_cutoff, para_rescue_cutoff, d_randstrobes,
+                                                        index.randstrobes.size(), d_randstrobe_start_indices,
+                                                        local_rescue_read_num,
+                                                        d_index_para,
+                                                        a_randstrobe_sizes, a_hashes, NULL, a_global_total_hits,
+                                                        a_global_nr_good_hits,
+                                                        a_rescue_seeds, timer_starts3, timer_ends3,
+                                                        global_hits_per_ref0s, global_hits_per_ref1s
+                                                        );
         cudaDeviceSynchronize();
         gpu_cost2 += GetTime() - t1;
+
+        t1 = GetTime();
+        gpu_step3_fast2<<<local_rescue_read_num, 32>>>(index.bits, index.filter_cutoff, para_rescue_cutoff, d_randstrobes,
+                                                      index.randstrobes.size(), d_randstrobe_start_indices,
+                                                      local_rescue_read_num,
+                                                      d_index_para,
+                                                      a_randstrobe_sizes, a_hashes, NULL, a_global_total_hits,
+                                                      a_global_nr_good_hits,
+                                                      a_rescue_seeds, timer_starts3, timer_ends3,
+                                                      global_hits_per_ref0s, global_hits_per_ref1s
+        );
+        cudaDeviceSynchronize();
+        gpu_cost3 += GetTime() - t1;
+
+        t1 = GetTime();
+
+        threads_per_block = 1;
+        reads_per_block = threads_per_block * GPU_read_thread_size;
+        blocks_per_grid = (s_len + reads_per_block - 1) / reads_per_block;
+        gpu_step3_fast3<<<blocks_per_grid, threads_per_block>>>(index.bits, index.filter_cutoff, para_rescue_cutoff, d_randstrobes,
+                                                      index.randstrobes.size(), d_randstrobe_start_indices,
+                                                      local_rescue_read_num,
+                                                      d_index_para,
+                                                      a_randstrobe_sizes, a_hashes, NULL, a_global_total_hits,
+                                                      a_global_nr_good_hits,
+                                                      a_rescue_seeds, timer_starts3, timer_ends3,
+                                                      global_hits_per_ref0s, global_hits_per_ref1s
+        );
+        cudaDeviceSynchronize();
+        gpu_cost4 += GetTime() - t1;
 
         for (int i = 0; i < s_len; ++i) {
             h_global_total_hits3 += a_global_total_hits[i * 2] + a_global_total_hits[i * 2 + 1];
             h_global_nr_good_hits3 += a_global_nr_good_hits[i * 2] + a_global_nr_good_hits[i * 2 + 1];
         }
 
-        double avg_time3[20];
-#pragma omp parallel for
-        for(int i = 0; i < 20; i++) {
-            avg_time3[i] = 0;
-            for(int j = 0; j < local_rescue_read_num; j++) {
-//                avg_time3[i] += timer_ends3[i][j] - timer_starts3[i][j];
-                avg_time3[i] += timer_starts3[i][j] / 1e3;
-            }
-            avg_time3[i] /= local_rescue_read_num;
-            tot_time3[i] += avg_time3[i];
-        }
-        double mx_time3[20];
-        uint64_t mx_tot_time = 0;
-        for(int i = 0; i < local_rescue_read_num; i++) {
-            if (timer_starts3[0][i] > mx_tot_time) {
-                mx_tot_time = timer_starts3[0][i];
-                for(int j = 0; j < 20; j++) {
-                    mx_time3[j] = timer_starts3[j][i] / 1e3;
-                }
-            }
-        }
-        for(int i = 0; i < local_rescue_read_num; i++) {
-            printf("==time3 %8d -- %10.1f : %10.1f %10.1f %10.1f %10.1f (%10.1f %10.1f %10.1f [%10.1f %10.1f %10.1f %10.1f %10.1f]) %10.1f\n", i,
-                   timer_starts3[0][i] / 1e3, timer_starts3[1][i] / 1e3, timer_starts3[2][i] / 1e3, timer_starts3[3][i] / 1e3, timer_starts3[4][i] / 1e3,
-                   timer_starts3[5][i] / 1e3, timer_starts3[6][i] / 1e3, timer_starts3[7][i] / 1e3,
-                   timer_starts3[8][i] / 1e3, timer_starts3[9][i] / 1e3, timer_starts3[10][i] / 1e3, timer_starts3[11][i] / 1e3, timer_starts3[12][i] / 1e3,
-                   timer_starts3[13][i] / 1e3);
-        }
-        printf("time3 -- %.3f : %.3f %.3f %.3f %.3f (%.3f %.3f %.3f [%.3f %.3f %.3f %.3f %.3f]) %.3f\n",
-               avg_time3[0], avg_time3[1], avg_time3[2], avg_time3[3], avg_time3[4],
-               avg_time3[5], avg_time3[6], avg_time3[7],
-               avg_time3[8], avg_time3[9], avg_time3[10], avg_time3[11], avg_time3[12],
-               avg_time3[13]);
-        printf("max time3 -- %.3f : %.3f %.3f %.3f %.3f (%.3f %.3f %.3f [%.3f %.3f %.3f %.3f %.3f]) %.3f\n\n",
-               mx_time3[0], mx_time3[1], mx_time3[2], mx_time3[3], mx_time3[4],
-               mx_time3[5], mx_time3[6], mx_time3[7],
-               mx_time3[8], mx_time3[9], mx_time3[10], mx_time3[11], mx_time3[12],
-               mx_time3[13]);
+//        double avg_time3[20];
+//#pragma omp parallel for
+//        for(int i = 0; i < 20; i++) {
+//            avg_time3[i] = 0;
+//            for(int j = 0; j < local_rescue_read_num; j++) {
+////                avg_time3[i] += timer_ends3[i][j] - timer_starts3[i][j];
+//                avg_time3[i] += timer_starts3[i][j] / 1e3;
+//            }
+//            avg_time3[i] /= local_rescue_read_num;
+//            tot_time3[i] += avg_time3[i];
+//        }
+//        double mx_time3[20];
+//        uint64_t mx_tot_time = 0;
+//        for(int i = 0; i < local_rescue_read_num; i++) {
+//            if (timer_starts3[0][i] > mx_tot_time) {
+//                mx_tot_time = timer_starts3[0][i];
+//                for(int j = 0; j < 20; j++) {
+//                    mx_time3[j] = timer_starts3[j][i] / 1e3;
+//                }
+//            }
+//        }
+//        for(int i = 0; i < local_rescue_read_num; i++) {
+//            printf("==time3 %8d -- %10.1f : %10.1f %10.1f %10.1f %10.1f (%10.1f %10.1f %10.1f [%10.1f %10.1f %10.1f %10.1f %10.1f]) %10.1f\n", i,
+//                   timer_starts3[0][i] / 1e3, timer_starts3[1][i] / 1e3, timer_starts3[2][i] / 1e3, timer_starts3[3][i] / 1e3, timer_starts3[4][i] / 1e3,
+//                   timer_starts3[5][i] / 1e3, timer_starts3[6][i] / 1e3, timer_starts3[7][i] / 1e3,
+//                   timer_starts3[8][i] / 1e3, timer_starts3[9][i] / 1e3, timer_starts3[10][i] / 1e3, timer_starts3[11][i] / 1e3, timer_starts3[12][i] / 1e3,
+//                   timer_starts3[13][i] / 1e3);
+//        }
+//        printf("time3 -- %.3f : %.3f %.3f %.3f %.3f (%.3f %.3f %.3f [%.3f %.3f %.3f %.3f %.3f]) %.3f\n",
+//               avg_time3[0], avg_time3[1], avg_time3[2], avg_time3[3], avg_time3[4],
+//               avg_time3[5], avg_time3[6], avg_time3[7],
+//               avg_time3[8], avg_time3[9], avg_time3[10], avg_time3[11], avg_time3[12],
+//               avg_time3[13]);
+//        printf("max time3 -- %.3f : %.3f %.3f %.3f %.3f (%.3f %.3f %.3f [%.3f %.3f %.3f %.3f %.3f]) %.3f\n\n",
+//               mx_time3[0], mx_time3[1], mx_time3[2], mx_time3[3], mx_time3[4],
+//               mx_time3[5], mx_time3[6], mx_time3[7],
+//               mx_time3[8], mx_time3[9], mx_time3[10], mx_time3[11], mx_time3[12],
+//               mx_time3[13]);
 
     }
     tot_cost += GetTime() - t0;
 
-    printf("tot time12 -- %.3f : %.3f %.3f %.3f %.3f (%.3f %.3f %.3f [%.3f %.3f %.3f %.3f %.3f]) %.3f\n",
-           tot_time12[0], tot_time12[1], tot_time12[2], tot_time12[3], tot_time12[4],
-           tot_time12[5], tot_time12[6], tot_time12[7],
-           tot_time12[8], tot_time12[9], tot_time12[10], tot_time12[11], tot_time12[12],
-           tot_time12[13]);
-    printf("tot time3 -- %.3f : %.3f %.3f %.3f %.3f (%.3f %.3f %.3f [%.3f %.3f %.3f %.3f %.3f]) %.3f\n",
-           tot_time3[0], tot_time3[1], tot_time3[2], tot_time3[3], tot_time3[4],
-           tot_time3[5], tot_time3[6], tot_time3[7],
-           tot_time3[8], tot_time3[9], tot_time3[10], tot_time3[11], tot_time3[12],
-           tot_time3[13]);
-    std::cout << "gpu cost " << gpu_cost1 << " " << gpu_cost2 << std::endl;
+//    printf("tot time12 -- %.3f : %.3f %.3f %.3f %.3f (%.3f %.3f %.3f [%.3f %.3f %.3f %.3f %.3f]) %.3f\n",
+//           tot_time12[0], tot_time12[1], tot_time12[2], tot_time12[3], tot_time12[4],
+//           tot_time12[5], tot_time12[6], tot_time12[7],
+//           tot_time12[8], tot_time12[9], tot_time12[10], tot_time12[11], tot_time12[12],
+//           tot_time12[13]);
+//    printf("tot time3 -- %.3f : %.3f %.3f %.3f %.3f (%.3f %.3f %.3f [%.3f %.3f %.3f %.3f %.3f]) %.3f\n",
+//           tot_time3[0], tot_time3[1], tot_time3[2], tot_time3[3], tot_time3[4],
+//           tot_time3[5], tot_time3[6], tot_time3[7],
+//           tot_time3[8], tot_time3[9], tot_time3[10], tot_time3[11], tot_time3[12],
+//           tot_time3[13]);
+    std::cout << "gpu cost " << gpu_cost1 << " " << gpu_cost2 << " " << gpu_cost3 << " " << gpu_cost4 << std::endl;
     std::cout << "total cost " << tot_cost << std::endl;
     std::cout << "check_sum : " << check_sum << ", size_tot : " << size_tot << std::endl;
     std::cout << a << " " << b << std::endl;
