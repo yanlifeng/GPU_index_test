@@ -4,15 +4,6 @@
 #include <iostream>
 #include <stdexcept>
 #include <cassert>
-#include "device/Ouroboros_impl.cuh"
-#include "device/MemoryInitialization.cuh"
-#include "InstanceDefinitions.cuh"
-#include "Utility.h"
-
-using MemoryManagerType = MultiOuroVLPQ;
-
-
-//#include <gallatin/allocators/global_allocator.cuh>
 
 struct Hit {
     int query_start;
@@ -23,7 +14,6 @@ struct Hit {
         if(query_start == other.query_start) return ref_start < other.ref_start;
         return query_start < other.query_start;
     }
-
     __host__ __device__  bool operator==(const Hit& other) const {
         return query_start == other.query_start &&
                query_end == other.query_end &&
@@ -44,17 +34,8 @@ struct RescueHit {
     }
 };
 
-//inline __device__ void* my_malloc(size_t size, MemoryManagerType* mm) {
-//    void* ptr = gallatin::allocators::global_malloc(size);
-//    return ptr;
-//}
-//
-//inline __device__ void my_free(void* ptr, MemoryManagerType* mm) {
-//    gallatin::allocators::global_free(ptr);
-//}
-
-__device__ void* my_malloc(size_t size, MemoryManagerType* mm = nullptr);
-__device__ void my_free(void* ptr, MemoryManagerType* mm = nullptr);
+__device__ void* my_malloc(size_t size);
+__device__ void my_free(void* ptr);
 
 __host__ void init_mm(uint64_t num_bytes, uint64_t seed);
 __host__ void free_mm();
@@ -65,37 +46,31 @@ struct my_vector {
     T* data = nullptr;
     int length;
     int capacity;
-    MemoryManagerType* mm_pool;
 
-    __host__ my_vector() : data(nullptr), length(0), capacity(0), mm_pool(nullptr) {
-    }
+//    __host__ my_vector() : data(nullptr), length(0), capacity(0) {}
 
-    __device__ my_vector(MemoryManagerType* mm_, int N = 4) {
-        mm_pool = mm_;
+    __device__ my_vector(int N = 4) {
         capacity = N;
         length = 0;
-        data = (T*)my_malloc(capacity * sizeof(T), mm_pool);
+        data = (T*)my_malloc(capacity * sizeof(T));
     }
 
-    __device__ void init(MemoryManagerType* mm_, int N = 4) {
-        mm_pool = mm_;
+    __device__ void init(int N = 4) {
         capacity = N;
         length = 0;
-        data = (T*)my_malloc(capacity * sizeof(T), mm_pool);
+        data = (T*)my_malloc(capacity * sizeof(T));
     }
 
     __device__ ~my_vector() {
-        if (data != nullptr) {
-            my_free(data, mm_pool);
-        }
+        if (data != nullptr) my_free(data);
         data = nullptr;
     }
 
     __device__ void resize(int new_capacity) {
         T* new_data;
-        new_data = (T*)my_malloc(new_capacity * sizeof(T), mm_pool);
+        new_data = (T*)my_malloc(new_capacity * sizeof(T));
         for (int i = 0; i < length; ++i) new_data[i] = data[i];
-        if (data != nullptr) my_free(data, mm_pool);
+        if (data != nullptr) my_free(data);
         data = new_data;
         capacity = new_capacity;
     }
@@ -116,31 +91,17 @@ struct my_vector {
     }
 
     __device__ void release() {
-        if (data != nullptr) {
-            my_free(data, mm_pool);
-//            free(data);
-        }
+        if (data != nullptr) my_free(data);
         data = nullptr;
     }
 
-
     __device__ T& operator[](int index) {
-//        if (index >= length) {
-//            printf("Index out of range %d %d\n", index, length);
-//            assert(false);
-//        }
         return data[index];
     }
 
     __device__ const T& operator[](int index) const {
-//        if (index >= length) {
-//            printf("Index out of range %d %d\n", index, length);
-//            assert(false);
-//        }
         return data[index];
     }
-
-
 };
 
 template <typename T>
@@ -164,10 +125,6 @@ template <typename T1, typename T2>
 struct my_pair {
     T1 first;
     T2 second;
-
-//    __device__ my_pair() : first(T1()), second(T2()) {}
-//    __device__ my_pair(const T1& a, const T2& b) : first(a), second(b) {}
-
     __device__ bool operator<(const my_pair& other) const {
         if (first < other.first) return true;
         if (first > other.first) return false;

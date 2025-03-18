@@ -1,8 +1,8 @@
 # Compiler and flags
 CXX = nvcc
 NVCC = nvcc
-CXXFLAGS  = -std=c++17 -arch=sm_86 -O3 -w -I./ -I/home/asc/someGit/Ouroboros/include/ --expt-relaxed-constexpr -I/home/asc/someGit/gallatin/include/ -rdc=true
-NVCCFLAGS = -std=c++17 -arch=sm_86 -O3 -w -I./ -I/home/asc/someGit/Ouroboros/include/ --expt-relaxed-constexpr -I/home/asc/someGit/gallatin/include/ -rdc=true
+CXXFLAGS  = -std=c++17 -arch=sm_86 -O3 -w -I./ -I/home/user_home/ylf/someGit/Ouroboros/include/ --expt-relaxed-constexpr -I/home/user_home/ylf/someGit/gallatin/include/ -rdc=true
+NVCCFLAGS = -std=c++17 -arch=sm_86 -O3 -w -I./ -I/home/user_home/ylf/someGit/Ouroboros/include/ --expt-relaxed-constexpr -I/home/user_home/ylf/someGit/gallatin/include/ -rdc=true
 
 
 # Directories
