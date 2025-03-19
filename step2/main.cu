@@ -84,8 +84,7 @@ int producer_pe_fastq_task(std::string file, std::string file2, rabbit::fq::Fast
 }
 
 
-__device__ randstrobe_hash_t
-gpu_get_hash(const RefRandstrobe *d_randstrobes, size_t d_randstrobes_size, my_bucket_index_t position) {
+__device__ inline randstrobe_hash_t gpu_get_hash(const RefRandstrobe *d_randstrobes, size_t d_randstrobes_size, my_bucket_index_t position) {
     if (position < d_randstrobes_size) {
         return d_randstrobes[position].hash;
     } else {
@@ -93,8 +92,7 @@ gpu_get_hash(const RefRandstrobe *d_randstrobes, size_t d_randstrobes_size, my_b
     }
 }
 
-__device__ bool
-gpu_is_filtered(const RefRandstrobe *d_randstrobes, size_t d_randstrobes_size, my_bucket_index_t position,
+__device__ inline bool gpu_is_filtered(const RefRandstrobe *d_randstrobes, size_t d_randstrobes_size, my_bucket_index_t position,
                 unsigned int filter_cutoff) {
     return gpu_get_hash(d_randstrobes, d_randstrobes_size, position) ==
            gpu_get_hash(d_randstrobes, d_randstrobes_size, position + filter_cutoff);
@@ -690,7 +688,6 @@ __device__ void add_to_hits_per_ref(
         int k
 ) {
     int min_diff = 1 << 30;
-    //printf("pos %llu, [%d %d]\n", position, query_start, query_end);
     for (const auto hash = gpu_get_hash(d_randstrobes, d_randstrobes_size, position); gpu_get_hash(d_randstrobes, d_randstrobes_size, position) == hash; ++position) {
         int ref_start = d_randstrobes[position].position;
         int ref_end = ref_start + d_randstrobes[position].strobe2_offset() + k;
@@ -751,7 +748,8 @@ __global__ void gpu_rescue_get_hits(
         my_vector<RescueHit> hits_t1;
         for (int i = 0; i < rescue_seeds[id].seeds_num; i++) {
             QueryRandstrobe q = rescue_seeds[id].seeds[i];
-            size_t position = gpu_find(d_randstrobes, d_randstrobe_start_indices, q.hash, bits);
+            //size_t position = gpu_find(d_randstrobes, d_randstrobe_start_indices, q.hash, bits);
+            size_t position = q.hash;
             if (position != static_cast<size_t>(-1)) {
                 unsigned int count = gpu_get_count(d_randstrobes, d_randstrobe_start_indices, position, bits);
                 RescueHit rh{position, count, q.start, q.end};
@@ -928,6 +926,109 @@ __global__ void gpu_get_randstrobes(
     }
 }
 
+__global__ void gpu_get_hits_after(
+        int bits,
+        unsigned int filter_cutoff,
+        int rescue_cutoff,
+        const RefRandstrobe *d_randstrobes,
+        size_t d_randstrobes_size,
+        const my_bucket_index_t *d_randstrobe_start_indices,
+        int num_tasks,
+        IndexParameters *index_para,
+        uint64_t *global_hits_num,
+        Rescue_Seeds *rescue_seeds,
+        my_vector<QueryRandstrobe>* global_randstrobes,
+        my_vector<my_pair<int, Hit>>* hits_per_ref0s,
+        my_vector<my_pair<int, Hit>>* hits_per_ref1s
+) {
+    int global_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int l_range = global_id * GPU_thread_task_size;
+    int r_range = l_range + GPU_thread_task_size;
+    if (r_range > num_tasks) r_range = num_tasks;
+    for (int id = l_range; id < r_range; id++) {
+        int read_id = id / 2;
+        int rev = id % 2;
+
+        my_vector<my_pair<int, Hit>>* hits_per_ref0;
+        my_vector<my_pair<int, Hit>>* hits_per_ref1;
+        hits_per_ref0 = (my_vector<my_pair<int, Hit>>*)my_malloc(sizeof(my_vector<my_pair<int, Hit>>));
+        hits_per_ref1 = (my_vector<my_pair<int, Hit>>*)my_malloc(sizeof(my_vector<my_pair<int, Hit>>));
+        hits_per_ref0->init();
+        hits_per_ref1->init();
+
+        uint64_t local_total_hits = 0;
+        uint64_t local_nr_good_hits = 0;
+        for (int i = 0; i < global_randstrobes[id].size(); i++) {
+            QueryRandstrobe q = global_randstrobes[id][i];
+            size_t position = q.hash;
+            if (position != static_cast<size_t>(-1)) {
+                local_total_hits++;
+                bool res = gpu_is_filtered(d_randstrobes, d_randstrobes_size, position, filter_cutoff);
+                if (res) continue;
+                local_nr_good_hits++;
+                if(q.is_reverse) {
+                    add_to_hits_per_ref(*hits_per_ref1, q.start, q.end, position, d_randstrobes, d_randstrobes_size, index_para->syncmer.k);
+                } else {
+                    add_to_hits_per_ref(*hits_per_ref0, q.start, q.end, position, d_randstrobes, d_randstrobes_size, index_para->syncmer.k);
+                }
+            }
+        }
+        float nonrepetitive_fraction = local_total_hits > 0 ? ((float) local_nr_good_hits) / ((float) local_total_hits) : 1.0;
+
+        if (nonrepetitive_fraction < 0.7 || hits_per_ref0->size() + hits_per_ref1->size() == 0) {
+            rescue_seeds[id].read_id = read_id;
+            rescue_seeds[id].read_fr = rev;
+            rescue_seeds[id].seeds_num = global_randstrobes[id].size();
+            for (int i = 0; i < global_randstrobes[id].size(); i++) {
+                rescue_seeds[id].seeds[i] = global_randstrobes[id][i];
+            }
+        }
+        global_hits_num[id] = hits_per_ref0->size() + hits_per_ref1->size();
+        hits_per_ref0s[id] = *hits_per_ref0;
+        hits_per_ref1s[id] = *hits_per_ref1;
+        my_free(hits_per_ref0);
+        my_free(hits_per_ref1);
+        global_randstrobes[id].release();
+    }
+}
+
+__global__ void gpu_get_hits_pre(
+        int bits,
+        unsigned int filter_cutoff,
+        int rescue_cutoff,
+        const RefRandstrobe *d_randstrobes,
+        size_t d_randstrobes_size,
+        const my_bucket_index_t *d_randstrobe_start_indices,
+        int num_tasks,
+        IndexParameters *index_para,
+        uint64_t *global_hits_num,
+        Rescue_Seeds *rescue_seeds,
+        my_vector<QueryRandstrobe>* global_randstrobes,
+        my_vector<my_pair<int, Hit>>* hits_per_ref0s,
+        my_vector<my_pair<int, Hit>>* hits_per_ref1s
+) {
+    int global_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int l_range = global_id * GPU_thread_task_size;
+    int r_range = l_range + GPU_thread_task_size;
+    if (r_range > num_tasks) r_range = num_tasks;
+    for (int id = l_range; id < r_range; id++) {
+        int read_id = id / 2;
+        int rev = id % 2;
+
+        uint64_t local_total_hits = 0;
+        uint64_t local_nr_good_hits = 0;
+        for (int i = 0; i < global_randstrobes[id].size(); i++) {
+            QueryRandstrobe q = global_randstrobes[id][i];
+            size_t position = gpu_find(d_randstrobes, d_randstrobe_start_indices, q.hash, bits);
+            global_randstrobes[id][i].hash = position;
+        }
+    }
+}
+
 __global__ void gpu_get_hits(
         int bits,
         unsigned int filter_cutoff,
@@ -965,6 +1066,7 @@ __global__ void gpu_get_hits(
         for (int i = 0; i < global_randstrobes[id].size(); i++) {
             QueryRandstrobe q = global_randstrobes[id][i];
             size_t position = gpu_find(d_randstrobes, d_randstrobe_start_indices, q.hash, bits);
+            global_randstrobes[id][i].hash = position;
             if (position != static_cast<size_t>(-1)) {
                 local_total_hits++;
                 bool res = gpu_is_filtered(d_randstrobes, d_randstrobes_size, position, filter_cutoff);
@@ -1349,6 +1451,8 @@ int main(int argc, char **argv) {
 
     double gpu_cost1 = 0;
     double gpu_cost2 = 0;
+    double gpu_cost2_1 = 0;
+    double gpu_cost2_2 = 0;
     double gpu_cost3 = 0;
     double gpu_cost4 = 0;
     double gpu_cost5 = 0;
@@ -1441,24 +1545,24 @@ int main(int argc, char **argv) {
         int reads_per_block;
         int blocks_per_grid;
 
-        threads_per_block = 2;
-        reads_per_block = threads_per_block * GPU_thread_task_size;
-        blocks_per_grid = (s_len * 2 + reads_per_block - 1) / reads_per_block;
-        gpu_get_randstrobes_and_hits<<<blocks_per_grid, threads_per_block>>>(index.bits, index.filter_cutoff, para_rescue_cutoff, d_randstrobes, index.randstrobes.size(), d_randstrobe_start_indices,
-                                                                    d_index_para, s_len * 2, d_pre_sum, d_len, d_seq, d_pre_sum2, d_len2, d_seq2, global_hits_num, global_rescue_seeds,
-                                                                    global_hits_per_ref0s, global_hits_per_ref1s, global_randstrobe_sizes, global_hashes_value);
-        cudaDeviceSynchronize();
-        gpu_cost1 += GetTime() - t1;
-
-        //threads_per_block = 32;
+        //threads_per_block = 2;
         //reads_per_block = threads_per_block * GPU_thread_task_size;
         //blocks_per_grid = (s_len * 2 + reads_per_block - 1) / reads_per_block;
-        //gpu_get_randstrobes<<<blocks_per_grid, threads_per_block>>>(s_len * 2, d_pre_sum, d_len, d_seq, d_pre_sum2, d_len2, d_seq2, d_index_para,
-        //                                                            global_randstrobe_sizes, global_hashes_value, global_randstrobes);
+        //gpu_get_randstrobes_and_hits<<<blocks_per_grid, threads_per_block>>>(index.bits, index.filter_cutoff, para_rescue_cutoff, d_randstrobes, index.randstrobes.size(), d_randstrobe_start_indices,
+        //                                                            d_index_para, s_len * 2, d_pre_sum, d_len, d_seq, d_pre_sum2, d_len2, d_seq2, global_hits_num, global_rescue_seeds,
+        //                                                            global_hits_per_ref0s, global_hits_per_ref1s, global_randstrobe_sizes, global_hashes_value);
         //cudaDeviceSynchronize();
         //gpu_cost1 += GetTime() - t1;
 
-        //t1 = GetTime();
+        threads_per_block = 32;
+        reads_per_block = threads_per_block * GPU_thread_task_size;
+        blocks_per_grid = (s_len * 2 + reads_per_block - 1) / reads_per_block;
+        gpu_get_randstrobes<<<blocks_per_grid, threads_per_block>>>(s_len * 2, d_pre_sum, d_len, d_seq, d_pre_sum2, d_len2, d_seq2, d_index_para,
+                                                                    global_randstrobe_sizes, global_hashes_value, global_randstrobes);
+        cudaDeviceSynchronize();
+        gpu_cost1 += GetTime() - t1;
+
+        t1 = GetTime();
         //threads_per_block = 1;
         //reads_per_block = threads_per_block * GPU_thread_task_size;
         //blocks_per_grid = (s_len * 2 + reads_per_block - 1) / reads_per_block;
@@ -1466,7 +1570,29 @@ int main(int argc, char **argv) {
         //                                                     s_len * 2, d_index_para, global_hits_num, global_rescue_seeds, global_randstrobes,
         //                                                     global_hits_per_ref0s, global_hits_per_ref1s);
         //cudaDeviceSynchronize();
-        //gpu_cost2 += GetTime() - t1;
+
+        double t11 = GetTime();
+        threads_per_block = 8;
+        reads_per_block = threads_per_block * GPU_thread_task_size;
+        blocks_per_grid = (s_len * 2 + reads_per_block - 1) / reads_per_block;
+        gpu_get_hits_pre<<<blocks_per_grid, threads_per_block>>>(index.bits, index.filter_cutoff, para_rescue_cutoff, d_randstrobes, index.randstrobes.size(), d_randstrobe_start_indices,
+                                                             s_len * 2, d_index_para, global_hits_num, global_rescue_seeds, global_randstrobes,
+                                                             global_hits_per_ref0s, global_hits_per_ref1s);
+        cudaDeviceSynchronize();
+        gpu_cost2_1 += GetTime() - t11;
+
+      
+        t11 = GetTime();
+        threads_per_block = 1;
+        reads_per_block = threads_per_block * GPU_thread_task_size;
+        blocks_per_grid = (s_len * 2 + reads_per_block - 1) / reads_per_block;
+        gpu_get_hits_after<<<blocks_per_grid, threads_per_block>>>(index.bits, index.filter_cutoff, para_rescue_cutoff, d_randstrobes, index.randstrobes.size(), d_randstrobe_start_indices,
+                                                             s_len * 2, d_index_para, global_hits_num, global_rescue_seeds, global_randstrobes,
+                                                             global_hits_per_ref0s, global_hits_per_ref1s);
+        cudaDeviceSynchronize();
+        gpu_cost2_2 += GetTime() - t11;
+
+        gpu_cost2 += GetTime() - t1;
 
 
         t1 = GetTime();
@@ -1557,7 +1683,7 @@ int main(int argc, char **argv) {
     }
     tot_cost += GetTime() - t0;
 
-    std::cout << "gpu cost " << gpu_cost1 << " " << gpu_cost2 << " " << gpu_cost3 << " " << gpu_cost4 << " " << gpu_cost5 << " " << gpu_cost6 << " " << gpu_cost7 << std::endl;
+    std::cout << "gpu cost " << gpu_cost1 << " " << gpu_cost2 << " [" << gpu_cost2_1 << " " << gpu_cost2_2 << "] " << gpu_cost3 << " " << gpu_cost4 << " " << gpu_cost5 << " " << gpu_cost6 << " " << gpu_cost7 << std::endl;
     std::cout << "total cost " << tot_cost << std::endl;
     std::cout << "check_sum : " << check_sum << ", size_tot : " << size_tot << std::endl;
     std::cout << "total_hits12 : " << global_hits_num12 << ", nr_good_hits12 : " << global_nams_info12 << std::endl;
