@@ -159,7 +159,7 @@ __device__ int gpu_get_count(
 //     return count;
 // }
 
-__device__ size_t gpu_find(
+__device__ inline size_t gpu_find(
         const RefRandstrobe *d_randstrobes,
         const my_bucket_index_t *d_randstrobe_start_indices,
         const randstrobe_hash_t key,
@@ -168,15 +168,27 @@ __device__ size_t gpu_find(
     const unsigned int top_N = key >> (64 - bits);
     my_bucket_index_t position_start = d_randstrobe_start_indices[top_N];
     my_bucket_index_t position_end = d_randstrobe_start_indices[top_N + 1];
-    if (position_start == position_end) {
-        return static_cast<size_t>(-1); // No match
-    }
-    for (my_bucket_index_t i = position_start; i < position_end; ++i) {
-        if (d_randstrobes[i].hash == key) {
-            return i;
+    if(position_end - position_start < 64) {
+        for (my_bucket_index_t i = position_start; i < position_end; ++i) {
+            if (d_randstrobes[i].hash == key) {
+                return i;
+            }
         }
+        return static_cast<size_t>(-1); // No match
+    } else {
+        my_bucket_index_t low = position_start, high = position_end;
+        while (low < high) {
+            my_bucket_index_t mid = low + (high - low) / 2;
+            if (d_randstrobes[mid].hash < key) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        if (d_randstrobes[low].hash == key) {
+            return low;
+        } else return static_cast<size_t>(-1); // No match
     }
-    return static_cast<size_t>(-1); // No match
 }
 
 template <typename T>
@@ -292,25 +304,40 @@ __device__ void sort_hits_single(
     //quick_sort(&(hits_per_ref[0]), hits_per_ref.size());
 }
 
+struct ref_ids_edge {
+    int pre;
+    int ref_id;
+};
+
+#define key_mod_val 29
+
+__device__ int find_ref_ids(int ref_id, int* head, ref_ids_edge* edges) {
+    int key = ref_id % key_mod_val;
+    for (int i = head[key]; i != -1; i = edges[i].pre) {
+        if (edges[i].ref_id == ref_id) return i;
+    }
+    return -1;
+}
 
 
 __device__ void sort_hits_by_refid(
         my_vector<my_pair<int, Hit>>& hits_per_ref
 ) {
-    my_vector<my_pair<int, my_vector<Hit>*>> all_hits;
+    my_vector<my_pair<int, my_vector<Hit>*>> all_hits(32);
+    int *head = (int*)my_malloc(key_mod_val * sizeof(int));
+    my_vector<ref_ids_edge> edges(32);
+    for(int i = 0; i < key_mod_val; i++) head[i] = -1;
+    int ref_ids_num = 0;
     for(int i = 0; i < hits_per_ref.size(); i++) {
         int ref_id = hits_per_ref[i].first;
-        int find_ref_id_rank = -1;
-        for(int j = 0; j < all_hits.size(); j++) {
-            if(all_hits[j].first == ref_id) {
-                find_ref_id_rank = j;
-                break;
-            }
-        }
+        int find_ref_id_rank = find_ref_ids(ref_id, head, edges.data);
         if (find_ref_id_rank == -1) {
-            find_ref_id_rank = all_hits.size();
+            find_ref_id_rank = ref_ids_num;
+            int key = ref_id % key_mod_val;
+            edges.push_back({head[key], ref_id});
+            head[key] = ref_ids_num++;
             my_vector<Hit>* hits = (my_vector<Hit>*)my_malloc(sizeof(my_vector<Hit>));
-            hits->init();
+            hits->init(32);
             all_hits.push_back({ref_id, hits});
         }
         all_hits[find_ref_id_rank].second->push_back(hits_per_ref[i].second);
@@ -323,6 +350,7 @@ __device__ void sort_hits_by_refid(
         all_hits[i].second->release();
         my_free(all_hits[i].second);
     }
+    my_free(head);
 }
 
 __device__ void sort_hits_parallel(
@@ -1069,16 +1097,26 @@ __global__ void gpu_get_hits_after(
     int r_range = l_range + GPU_thread_task_size;
     if (r_range > num_tasks) r_range = num_tasks;
     for (int id = l_range; id < r_range; id++) {
-        if (global_randstrobes[id].size() == 0) continue;
-        int read_id = id / 2;
-        int rev = id % 2;
 
+        int sum_seeds0 = 0;
+        int sum_seeds1 = 0;
+        for (int i = 0; i < global_randstrobes[id].size(); i++) {
+//            size_t position = global_randstrobes[id][i].hash;
+//            if (position == static_cast<size_t>(-1)) continue;
+//            bool res = gpu_is_filtered(d_randstrobes, d_randstrobes_size, position, filter_cutoff);
+//            if (res) continue;
+            if (global_randstrobes[id][i].is_reverse) {
+                sum_seeds1++;
+            } else {
+                sum_seeds0++;
+            }
+        }
         my_vector<my_pair<int, Hit>>* hits_per_ref0;
         my_vector<my_pair<int, Hit>>* hits_per_ref1;
         hits_per_ref0 = (my_vector<my_pair<int, Hit>>*)my_malloc(sizeof(my_vector<my_pair<int, Hit>>));
         hits_per_ref1 = (my_vector<my_pair<int, Hit>>*)my_malloc(sizeof(my_vector<my_pair<int, Hit>>));
-        hits_per_ref0->init();
-        hits_per_ref1->init();
+        hits_per_ref0->init(sum_seeds0 * 2);
+        hits_per_ref1->init(sum_seeds1 * 2);
 
         uint64_t local_total_hits = 0;
         uint64_t local_nr_good_hits = 0;
@@ -1132,11 +1170,6 @@ __global__ void gpu_get_hits_pre(
     int r_range = l_range + GPU_thread_task_size;
     if (r_range > num_tasks) r_range = num_tasks;
     for (int id = l_range; id < r_range; id++) {
-        int read_id = id / 2;
-        int rev = id % 2;
-
-        uint64_t local_total_hits = 0;
-        uint64_t local_nr_good_hits = 0;
         for (int i = 0; i < global_randstrobes[id].size(); i++) {
             QueryRandstrobe q = global_randstrobes[id][i];
             size_t position = gpu_find(d_randstrobes, d_randstrobe_start_indices, q.hash, bits);
@@ -1686,7 +1719,7 @@ int main(int argc, char **argv) {
 
       
         t11 = GetTime();
-        threads_per_block = 1;
+        threads_per_block = 32;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (s_len * 2 + reads_per_block - 1) / reads_per_block;
         gpu_get_hits_after<<<blocks_per_grid, threads_per_block>>>(index.bits, index.filter_cutoff, para_rescue_cutoff, d_randstrobes, index.randstrobes.size(), d_randstrobe_start_indices,

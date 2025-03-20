@@ -49,13 +49,13 @@ struct my_vector {
 
 //    __host__ my_vector() : data(nullptr), length(0), capacity(0) {}
 
-    __device__ my_vector(int N = 4) {
+    __device__ my_vector(int N = 16) {
         capacity = N;
         length = 0;
         data = (T*)my_malloc(capacity * sizeof(T));
     }
 
-    __device__ void init(int N = 4) {
+    __device__ void init(int N = 16) {
         capacity = N;
         length = 0;
         data = (T*)my_malloc(capacity * sizeof(T));
