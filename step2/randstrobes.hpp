@@ -187,9 +187,10 @@ public:
             uint64_t hash_diff = (strobe1.hash ^ (*gpu_syncmers)[i].hash) & q;
             uint64_t res = 0;
 
-            for (int j = 0; j < 64; j++) {
-                res += ((hash_diff >> j) & 1);
-            }
+//            for (int j = 0; j < 64; j++) {
+//                res += ((hash_diff >> j) & 1);
+//            }
+            res = __popcll(hash_diff);
 
             if (res < min_val) {
                 min_val = res;

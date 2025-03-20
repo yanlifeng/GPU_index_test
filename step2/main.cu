@@ -900,56 +900,151 @@ __global__ void gpu_get_randstrobes(
             seq = all_seqs2 + pre_sum2[read_id];
         }
 
+        my_vector<Syncmer> syncmers(len);
+
+        const int k = index_para->syncmer.k;
+        const int s = index_para->syncmer.s;
+        const int t = index_para->syncmer.t_syncmer;
+
+        const uint64_t kmask = (1ULL << 2 * k) - 1;
+        const uint64_t smask = (1ULL << 2 * s) - 1;
+        const uint64_t kshift = (k - 1) * 2;
+        const uint64_t sshift = (s - 1) * 2;
+        uint64_t gpu_qs[200];
+        int l_pos = 0;
+        int r_pos = 0;
+        uint64_t qs_min_val = UINT64_MAX;
+        int qs_min_pos = -1;
+        int l = 0;
+        uint64_t xk[2] = {0, 0};
+        uint64_t xs[2] = {0, 0};
+        for (size_t i = 0; i < len; i++) {
+            int c = seq_nt4_table[(uint8_t) seq[i]];
+            if (c < 4) { // not an "N" base
+                xk[0] = (xk[0] << 2 | c) & kmask;                  // forward strand
+                xk[1] = xk[1] >> 2 | (uint64_t)(3 - c) << kshift;  // reverse strand
+                xs[0] = (xs[0] << 2 | c) & smask;                  // forward strand
+                xs[1] = xs[1] >> 2 | (uint64_t)(3 - c) << sshift;  // reverse strand
+                if (++l < s) {
+                    continue;
+                }
+                // we find an s-mer
+                uint64_t ys = xs[0] < xs[1] ? xs[0] : xs[1];
+                uint64_t hash_s = syncmer_smer_hash(ys);
+                gpu_qs[r_pos++] = hash_s;
+                // not enough hashes in the queue, yet
+                if (r_pos - l_pos < k - s + 1) {
+                    continue;
+                }
+                if (r_pos - l_pos == k - s + 1) { // We are at the last s-mer within the first k-mer, need to decide if we add it
+                    for (int j = l_pos; j < r_pos; j++) {
+                        if (gpu_qs[j] < qs_min_val) {
+                            qs_min_val = gpu_qs[j];
+                            qs_min_pos = i - k + j - l_pos + 1;
+                        }
+                    }
+                } else {
+                    // update queue and current minimum and position
+                    l_pos++;
+                    if (qs_min_pos == i - k) { // we popped the previous minimizer, find new brute force
+                        qs_min_val = UINT64_MAX;
+                        qs_min_pos = i - s + 1;
+                        for (int j = r_pos - 1; j >= l_pos; j--) { //Iterate in reverse to choose the rightmost minimizer in a window
+                            if (gpu_qs[j] < qs_min_val) {
+                                qs_min_val = gpu_qs[j];
+                                qs_min_pos = i - k + j - l_pos + 1;
+                            }
+                        }
+                    } else if (hash_s < qs_min_val) { // the new value added to queue is the new minimum
+                        qs_min_val = hash_s;
+                        qs_min_pos = i - s + 1;
+                    }
+                }
+                if (qs_min_pos == i - k + t) { // occurs at t:th position in k-mer
+                    uint64_t yk = xk[0] < xk[1] ? xk[0] : xk[1];
+                    syncmers.push_back(Syncmer{syncmer_kmer_hash(yk), i - k + 1});
+                }
+            } else {
+                // if there is an "N", restart
+                qs_min_val = UINT64_MAX;
+                qs_min_pos = -1;
+                l = xs[0] = xs[1] = xk[0] = xk[1] = 0;
+                r_pos = 0;
+                l_pos = 0;
+            }
+        }
+
+
+        const int w_min = index_para->randstrobe.w_min;
+        const int w_max = index_para->randstrobe.w_max;
+        const uint64_t q = index_para->randstrobe.q;
+        const int max_dist = index_para->randstrobe.max_dist;
+
         my_vector<QueryRandstrobe> *randstrobes;
         randstrobes = (my_vector<QueryRandstrobe>*)my_malloc(sizeof(my_vector<QueryRandstrobe>));
-        randstrobes->init();
+        randstrobes->init((my_max(syncmers.size() - w_min, 0)) * 2);
 
-        my_vector<Syncmer> syncmers;
-        my_vector<uint64_t> vec4syncmers;
 
-        SyncmerIterator syncmer_iterator{&vec4syncmers, seq, len, (*index_para).syncmer};
-        Syncmer syncmer;
-        while (1) {
-            syncmer = syncmer_iterator.gpu_next();
-            if (syncmer.is_end()) break;
-            syncmers.push_back(syncmer);
+        for (int strobe1_index = 0; strobe1_index + w_min < syncmers.size(); strobe1_index++) {
+            unsigned int w_end = (strobe1_index + w_max < syncmers.size() - 1) ? (strobe1_index + w_max) : syncmers.size() - 1;
+            auto strobe1 = syncmers[strobe1_index];
+            auto max_position = strobe1.position + max_dist;
+            unsigned int w_start = strobe1_index + w_min;
+            uint64_t min_val = 0xFFFFFFFFFFFFFFFF;
+            Syncmer strobe2 = strobe1;
+            for (auto i = w_start; i <= w_end && syncmers[i].position <= max_position; i++) {
+                uint64_t hash_diff = (strobe1.hash ^ syncmers[i].hash) & q;
+                uint64_t res = __popcll(hash_diff);
+                if (res < min_val) {
+                    min_val = res;
+                    strobe2 = syncmers[i];
+                }
+            }
+            randstrobes->push_back(
+                    QueryRandstrobe{
+                            randstrobe_hash(strobe1.hash, strobe2.hash), static_cast<uint32_t>(strobe1.position),
+                            static_cast<uint32_t>(strobe2.position) + index_para->syncmer.k, false
+                    }
+            );
         }
 
-        if (syncmers.size() != 0)  {
-            RandstrobeIterator randstrobe_fwd_iter{&syncmers, (*index_para).randstrobe};
-            while (randstrobe_fwd_iter.gpu_has_next()) {
-                Randstrobe randstrobe = randstrobe_fwd_iter.gpu_next();
-                randstrobes->push_back(
-                        QueryRandstrobe{
-                                randstrobe.hash, randstrobe.strobe1_pos,
-                                randstrobe.strobe2_pos + (*index_para).syncmer.k, false
-                        }
-                );
-            }
 
-            for (int i = 0; i < syncmers.size() / 2; i++) {
-                my_swap(syncmers[i], syncmers[syncmers.size() - i - 1]);
-            }
-            for (size_t i = 0; i < syncmers.size(); i++) {
-                syncmers[i].position = len - syncmers[i].position - (*index_para).syncmer.k;
-            }
-
-            RandstrobeIterator randstrobe_rc_iter{&syncmers, (*index_para).randstrobe};
-            while (randstrobe_rc_iter.gpu_has_next()) {
-                Randstrobe randstrobe = randstrobe_rc_iter.gpu_next();
-                randstrobes->push_back(
-                        QueryRandstrobe{
-                                randstrobe.hash, randstrobe.strobe1_pos,
-                                randstrobe.strobe2_pos + (*index_para).syncmer.k, true
-                        }
-                );
-            }
+        for (int i = 0; i < syncmers.size() / 2; i++) {
+            my_swap(syncmers[i], syncmers[syncmers.size() - i - 1]);
         }
+        for (size_t i = 0; i < syncmers.size(); i++) {
+            syncmers[i].position = len - syncmers[i].position - (*index_para).syncmer.k;
+        }
+
+        for (int strobe1_index = 0; strobe1_index + w_min < syncmers.size(); strobe1_index++) {
+            unsigned int w_end = (strobe1_index + w_max < syncmers.size() - 1) ? (strobe1_index + w_max) : syncmers.size() - 1;
+            auto strobe1 = syncmers[strobe1_index];
+            auto max_position = strobe1.position + max_dist;
+            unsigned int w_start = strobe1_index + w_min;
+            uint64_t min_val = 0xFFFFFFFFFFFFFFFF;
+            Syncmer strobe2 = strobe1;
+            for (auto i = w_start; i <= w_end && syncmers[i].position <= max_position; i++) {
+                uint64_t hash_diff = (strobe1.hash ^ syncmers[i].hash) & q;
+                uint64_t res = __popcll(hash_diff);
+                if (res < min_val) {
+                    min_val = res;
+                    strobe2 = syncmers[i];
+                }
+            }
+            randstrobes->push_back(
+                    QueryRandstrobe{
+                            randstrobe_hash(strobe1.hash, strobe2.hash), static_cast<uint32_t>(strobe1.position),
+                            static_cast<uint32_t>(strobe2.position) + index_para->syncmer.k, true
+                    }
+            );
+        }
+
 
         randstrobe_sizes[id] += randstrobes->size();
         for (int i = 0; i < randstrobes->size(); i++) hashes[id] += (*randstrobes)[i].hash;
         global_randstrobes[id] = *randstrobes;
         my_free(randstrobes);
+//        randstrobe_sizes[id] += syncmers.size();
     }
 }
 
@@ -974,6 +1069,7 @@ __global__ void gpu_get_hits_after(
     int r_range = l_range + GPU_thread_task_size;
     if (r_range > num_tasks) r_range = num_tasks;
     for (int id = l_range; id < r_range; id++) {
+        if (global_randstrobes[id].size() == 0) continue;
         int read_id = id / 2;
         int rev = id % 2;
 
