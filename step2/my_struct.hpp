@@ -99,7 +99,7 @@ struct my_vector {
         return data[index];
     }
 
-    __device__ const T& operator[](int index) const {
+    __host__ __device__ const T& operator[](int index) const {
         return data[index];
     }
 };
@@ -112,12 +112,12 @@ __device__ void my_swap(T& a, T& b) {
 }
 
 template <typename T>
-__device__ T my_max(T a, T b) {
+__host__ __device__ T my_max(T a, T b) {
     return a > b ? a : b;
 }
 
 template <typename T>
-__device__ T my_min(T a, T b) {
+__host__ __device__ T my_min(T a, T b) {
     return a < b ? a : b;
 }
 
