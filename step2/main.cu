@@ -30,9 +30,9 @@
 #include "readlen.hpp"
 #include "my_struct.hpp"
 
-#include <thrust/sort.h>
-#include <thrust/device_vector.h>
-#include <thrust/host_vector.h>
+//#include <thrust/sort.h>
+//#include <thrust/device_vector.h>
+//#include <thrust/host_vector.h>
 
 #define my_bucket_index_t StrobemerIndex::bucket_index_t
 
@@ -169,6 +169,7 @@ __device__ inline size_t gpu_find(
     my_bucket_index_t position_start = d_randstrobe_start_indices[top_N];
     my_bucket_index_t position_end = d_randstrobe_start_indices[top_N + 1];
     if(position_end - position_start < 64) {
+    //if(1) {
         for (my_bucket_index_t i = position_start; i < position_end; ++i) {
             if (d_randstrobes[i].hash == key) {
                 return i;
@@ -223,45 +224,92 @@ __device__ void dfs_quick_sort(T* data, int low, int high) {
     }
 }
 
-
-
 template <typename T>
-__device__ void quick_sort_iterative(T* data, int low, int high) {
-    int vec_size = high - low + 1;
-    if(vec_size == 0) return;
-    my_vector<int>stack_vec(vec_size * 2);
-    int* stack = stack_vec.data;
+struct DefaultCompare {
+    __device__ __forceinline__
+    bool operator()(const T& a, const T& b) const {
+        return a < b;
+    }
+};
+template <typename T, typename Compare = DefaultCompare<T>>
+__device__ void quick_sort_iterative(
+        T* data,
+        int low,
+        int high,
+        Compare comp = DefaultCompare<T>()
+) {
+//    static_assert(
+//            __is_invocable_bool<Compare, T, T>::value,
+//            "Invalid comparison function signature"
+//    );
+
+    int stack[64];
     int top = -1;
+
     stack[++top] = low;
     stack[++top] = high;
-    int mx_top = 0;
+
     while (top >= 0) {
         high = stack[top--];
         low = stack[top--];
-        // Partition
-        T pivot = data[high];
+
+        if (high - low < 32) {
+            insertion_sort(data, low, high, comp);
+            continue;
+        }
+
+        int mid = low + (high - low)/2;
+        if (comp(data[high], data[mid])) my_swap(data[mid], data[high]);
+        if (comp(data[high], data[low])) my_swap(data[low], data[high]);
+        if (comp(data[mid], data[low])) my_swap(data[low], data[mid]);
+
+        T pivot = data[mid];
+
         int i = low - 1;
-        for (int j = low; j < high; ++j) {
-            if (data[j] < pivot) {
-                ++i;
-                T temp = data[i];
-                data[i] = data[j];
-                data[j] = temp;
+        int j = high + 1;
+        while (true) {
+            do { ++i; } while (comp(data[i], pivot));
+            do { --j; } while (comp(pivot, data[j]));
+            if (i >= j) break;
+            my_swap(data[i], data[j]);
+        }
+        int p = j;
+
+        if (p - low < high - p) {
+            if (low < p) {
+                stack[++top] = low;
+                stack[++top] = p;
+            }
+            if (p+1 < high) {
+                stack[++top] = p+1;
+                stack[++top] = high;
+            }
+        } else {
+            if (p+1 < high) {
+                stack[++top] = p+1;
+                stack[++top] = high;
+            }
+            if (low < p) {
+                stack[++top] = low;
+                stack[++top] = p;
             }
         }
-        T temp = data[i + 1];
-        data[i + 1] = data[high];
-        data[high] = temp;
-        int pivot_index = i + 1;
-        if (pivot_index - 1 > low) {
-            stack[++top] = low;
-            stack[++top] = pivot_index - 1;
+    }
+}
+
+
+template <typename T, typename Compare>
+__device__ void insertion_sort(T* data, int low, int high, Compare comp) {
+    for (int i = low + 1; i <= high; ++i) {
+        T key = data[i];
+        int j = i - 1;
+
+#pragma unroll
+        while (j >= low && comp(key, data[j])) {
+            data[j + 1] = data[j];
+            --j;
         }
-        if (pivot_index + 1 < high) {
-            stack[++top] = pivot_index + 1;
-            stack[++top] = high;
-        }
-        mx_top = my_max(mx_top, top);
+        data[j + 1] = key;
     }
 }
 
@@ -280,8 +328,8 @@ __device__ void bubble_sort(T* data, int size) {
 
 template <typename T>
 __device__ void quick_sort(T* data, int size) {
-    quick_sort_iterative(data, 0, size - 1);
-    //bubble_sort(data, size);
+    //quick_sort_iterative(data, 0, size - 1);
+    bubble_sort(data, size);
 
 }
 
@@ -292,7 +340,1016 @@ struct Rescue_Seeds {
     QueryRandstrobe* seeds;
 };
 
+__device__ void print_nam(Nam nam) {
+    printf("nam_id: %d, ref_id: %d, ref_start: %d, ref_end: %d, query_start: %d, query_end: %d, n_hits: %d, is_rc: %d\n",
+           nam.nam_id, nam.ref_id, nam.ref_start, nam.ref_end, nam.query_start, nam.query_end, nam.n_hits, nam.is_rc);
+}
 
+__device__ void print_str(my_string str) {
+    for(int i = 0; i < str.size(); i++) {
+        printf("%c", str[i]);
+    }
+    printf("\n");
+}
+
+struct GPURead {
+    char* seq;
+    char* rc;
+    int length;
+    __device__ int size() const { return length; }
+};
+
+struct GPUAlignment {
+    int ref_id;
+    int ref_start;
+    my_vector<uint32_t> cigar;
+    int edit_distance;
+    int global_ed;
+    int score;
+    int length;
+    bool is_rc;
+    bool is_unaligned{false};
+    // Whether a gapped alignment function was used to obtain this alignment
+    // (even if true, the alignment can still be without gaps)
+    bool gapped{false};
+    __device__ void move_to(GPUAlignment& dest) {
+        dest.ref_id = ref_id;
+        dest.ref_start = ref_start;
+        dest.cigar.move_from(cigar);
+        dest.edit_distance = edit_distance;
+        dest.global_ed = global_ed;
+        dest.score = score;
+        dest.length = length;
+        dest.is_rc = is_rc;
+        dest.is_unaligned = is_unaligned;
+        dest.gapped = gapped;
+    }
+
+};
+
+struct GPUAlignTmpRes {
+    int type;
+    // type 0 : size1 == 0 size2 == 0, unmapped_pair
+    // type 1 : size1 == 0, rescue read1
+    // type 2 : size2 == 0, rescue read2
+    // type 3 : good pair
+    // type 4 : for loop
+    int mapq1;
+    int mapq2;
+    int type4_loop_size;
+    my_vector<bool> is_extend_seed;
+    my_vector<bool> consistent_nam;
+    my_vector<bool> is_read1;
+    my_vector<Nam> type4_nams;
+    my_vector<Nam> todo_nams;
+    my_vector<bool> done_align;
+    // if done_align, align_res is the alignment results
+    my_vector<GPUAlignment> align_res;
+};
+
+struct GPUReferences {
+    my_vector<my_string> sequences;
+    my_vector<size_t> lengths;
+    int num_refs;
+};
+
+struct GPUAlignmentInfo {
+    my_vector<uint32_t> cigar;
+    unsigned int edit_distance{0};
+    unsigned int ref_start{0};
+    unsigned int ref_end{0};
+    unsigned int query_start{0};
+    unsigned int query_end{0};
+    int sw_score{0};
+
+    __device__ int ref_span() const { return ref_end - ref_start; }
+};
+
+__device__ void cigar_push(my_vector<uint32_t>& m_ops, uint8_t op, int len) {
+    assert(op < 16);
+    if (m_ops.empty() || (m_ops.back() & 0xf) != op) {
+        m_ops.push_back(len << 4 | op);
+    } else {
+        m_ops.back() += len << 4;
+    }
+}
+
+__device__ void my_hamming_align(const my_string &query, const my_string &ref, int match, int mismatch, int end_bonus, GPUAlignmentInfo& aln) {
+    if (query.length() != ref.length()) {
+        return;
+    }
+    size_t n = query.length();
+
+    size_t start = 0; // start of the current segment
+    int score = end_bonus; // accumulated score so far in the current segment
+
+    size_t best_start = 0;
+    size_t best_end = 0;
+    int best_score = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (query[i] == ref[i]) {
+            score += match;
+        } else {
+            score -= mismatch;
+        }
+        if (score < 0) {
+            start = i + 1;
+            score = 0;
+        }
+        if (score > best_score) {
+            best_start = start;
+            best_score = score;
+            best_end = i + 1;
+        }
+    }
+    if (score + end_bonus > best_score) {
+        best_score = score + end_bonus;
+        best_end = query.length();
+        best_start = start;
+    }
+
+    size_t segment_start = best_start;
+    size_t segment_end = best_end;
+    score = best_score;
+
+    if (segment_start > 0) {
+        cigar_push(aln.cigar, CIGAR_SOFTCLIP, segment_start);
+    }
+
+    // Create CIGAR string and count mismatches
+    int counter = 0;
+    bool prev_is_match = false;
+    int mismatches = 0;
+    bool first = true;
+    for (size_t i = segment_start; i < segment_end; i++) {
+        bool is_match = query[i] == ref[i];
+        mismatches += is_match ? 0 : 1;
+        if (!first && is_match != prev_is_match) {
+            cigar_push(aln.cigar, prev_is_match ? CIGAR_EQ : CIGAR_X, counter);
+            counter = 0;
+        }
+        counter++;
+        prev_is_match = is_match;
+        first = false;
+    }
+    if (!first) {
+        cigar_push(aln.cigar, prev_is_match ? CIGAR_EQ : CIGAR_X, counter);
+    }
+
+    int soft_right = query.length() - segment_end;
+    if (soft_right > 0) {
+        cigar_push(aln.cigar, CIGAR_SOFTCLIP, soft_right);
+    }
+
+    aln.sw_score = score;
+    aln.edit_distance = mismatches;
+    aln.ref_start = segment_start;
+    aln.ref_end = segment_end;
+    aln.query_start = segment_start;
+    aln.query_end = segment_end;
+    return;
+}
+
+__device__ bool extend_seed_part(
+        GPUAlignTmpRes& align_tmp_res,
+        const AlignmentParameters& aligner_parameters,
+        const Nam& nam,
+        const GPUReferences& references,
+        const GPURead& read,
+        bool consistent_nam
+) {
+    const my_string query(nam.is_rc ? read.rc : read.seq, read.length);
+    const my_string ref = references.sequences[nam.ref_id];
+
+    const auto projected_ref_start = my_max(0, nam.ref_start - nam.query_start);
+    const auto projected_ref_end = my_min(nam.ref_end + query.size() - nam.query_end, ref.size());
+
+    GPUAlignmentInfo info;
+    int result_ref_start;
+    bool gapped = true;
+    if (projected_ref_end - projected_ref_start == query.size() && consistent_nam) {
+        my_string ref_segm_ham = ref.substr(projected_ref_start, query.size());
+        int hamming_dist = 0;
+        for (size_t i = 0; i < query.size(); ++i) {
+            if (query[i] != ref_segm_ham[i]) {
+                ++hamming_dist;
+            }
+        }
+
+        //if (hamming_dist >= 0 && (((float) hamming_dist / query.size()) < 0.05)) {  //Hamming distance worked fine, no need to ksw align
+        if (0) {
+            my_hamming_align(
+                    query, ref_segm_ham, aligner_parameters.match, aligner_parameters.mismatch,
+                    aligner_parameters.end_bonus, info
+            );
+            result_ref_start = projected_ref_start + info.ref_start;
+            gapped = false;
+        }
+    }
+
+    align_tmp_res.todo_nams.push_back(nam);
+    align_tmp_res.is_extend_seed.push_back(true);
+    if (gapped) {
+        // not pass hamming, pending to do align on GPU, tag is false
+        GPUAlignment alignment;
+        align_tmp_res.done_align.push_back(false);
+        //align_tmp_res.align_res.push_back(alignment);
+        align_tmp_res.align_res.emplace_back();
+        alignment.move_to(align_tmp_res.align_res.back());
+    } else {
+        // pass hamming, store result, tag is true
+        align_tmp_res.done_align.push_back(true);
+        int softclipped = info.query_start + (query.size() - info.query_end);
+        GPUAlignment alignment;
+        alignment.cigar.move_from(info.cigar);
+        alignment.edit_distance = info.edit_distance;
+        alignment.global_ed = info.edit_distance + softclipped;
+        alignment.score = info.sw_score;
+        alignment.ref_start = result_ref_start;
+        alignment.length = info.ref_span();
+        alignment.is_rc = nam.is_rc;
+        alignment.is_unaligned = false;
+        alignment.ref_id = nam.ref_id;
+        alignment.gapped = gapped;
+        //align_tmp_res.align_res.push_back(alignment);
+        align_tmp_res.align_res.emplace_back();
+        alignment.move_to(align_tmp_res.align_res.back());
+    }
+    return gapped;
+}
+
+__device__ bool has_shared_substring(const my_string& read_seq, const my_string& ref_seq, int k) {
+    int sub_size = 2 * k / 3;
+    int step_size = k / 3;
+    my_string submer;
+    for (size_t i = 0; i + sub_size < read_seq.size(); i += step_size) {
+        submer = read_seq.substr(i, sub_size);
+        if (ref_seq.find(submer) != -1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+__device__ bool rescue_mate_part(
+        GPUAlignTmpRes& align_tmp_res,
+        const AlignmentParameters& aligner_parameters,
+        const Nam& nam,
+        const GPUReferences& references,
+        const GPURead& read,
+        float mu,
+        float sigma,
+        int k
+) {
+    GPUAlignment alignment;
+    int a, b;
+    my_string r_tmp;
+    auto read_len = read.size();
+
+    if (nam.is_rc) {
+        r_tmp = my_string(read.seq, read_len);
+        a = nam.ref_start - nam.query_start - (mu + 5 * sigma);
+        b = nam.ref_start - nam.query_start + read_len / 2;  // at most half read overlap
+    } else {
+        r_tmp = my_string(read.rc, read_len);                                             // mate is rc since fr orientation
+        a = nam.ref_end + (read_len - nam.query_end) - read_len / 2;  // at most half read overlap
+        b = nam.ref_end + (read_len - nam.query_end) + (mu + 5 * sigma);
+    }
+
+    //if (nam.ref_id != 0) printf("gg ref id %d\n", nam.ref_id);
+    //assert(nam.ref_id == 0);
+    auto ref_len = static_cast<int>(references.lengths[nam.ref_id]);
+    auto ref_start = my_max(0, my_min(a, ref_len));
+    auto ref_end = my_min(ref_len, my_max(0, b));
+
+    align_tmp_res.todo_nams.push_back(nam);
+    align_tmp_res.is_extend_seed.push_back(false);
+    return false;
+    if (ref_end < ref_start + k) {
+    //if (0) {
+//        alignment.cigar = Cigar();
+        alignment.edit_distance = read_len;
+        alignment.score = 0;
+        alignment.ref_start = 0;
+        alignment.is_rc = nam.is_rc;
+        alignment.ref_id = nam.ref_id;
+        alignment.is_unaligned = true;
+        align_tmp_res.done_align.push_back(true);
+        //align_tmp_res.align_res.push_back(alignment);
+        align_tmp_res.align_res.emplace_back();
+        alignment.move_to(align_tmp_res.align_res.back());
+ 
+        return true;
+    }
+    my_string ref_segm = references.sequences[nam.ref_id].substr(ref_start, ref_end - ref_start);
+
+    if (!has_shared_substring(r_tmp, ref_segm, k)) {
+    //if (0) {
+//        alignment.cigar = Cigar();
+        alignment.edit_distance = read_len;
+        alignment.score = 0;
+        alignment.ref_start = 0;
+        alignment.is_rc = nam.is_rc;
+        alignment.ref_id = nam.ref_id;
+        alignment.is_unaligned = true;
+        align_tmp_res.done_align.push_back(true);
+        //align_tmp_res.align_res.push_back(alignment);
+        align_tmp_res.align_res.emplace_back();
+        alignment.move_to(align_tmp_res.align_res.back());
+ 
+        return true;
+    }
+
+    align_tmp_res.done_align.push_back(false);
+    //align_tmp_res.align_res.push_back(alignment);
+    align_tmp_res.align_res.emplace_back();
+    alignment.move_to(align_tmp_res.align_res.back());
+ 
+    return false;
+}
+
+
+__device__ bool reverse_nam_if_needed(Nam& nam, const GPURead& read, const GPUReferences& references, int k) {
+    auto read_len = read.size();
+    if(nam.ref_id >= references.sequences.size()) {
+        printf("ref_id %d, ref_size %d\n", nam.ref_id, references.sequences.size());
+    }
+    if(nam.ref_start >= references.sequences[nam.ref_id].size()) {
+        printf("ref_start %d, ref_size %d\n", nam.ref_start, references.sequences[nam.ref_id].size());
+    }
+    my_string ref_start_kmer = references.sequences[nam.ref_id].substr(nam.ref_start, k);
+    my_string ref_end_kmer = references.sequences[nam.ref_id].substr(nam.ref_end - k, k);
+
+//    printf("ref_start_kmer: ");
+//    print_str(ref_start_kmer);
+//    printf("ref_end_kmer: ");
+//    print_str(ref_end_kmer);
+
+    my_string seq, seq_rc;
+    if (nam.is_rc) {
+        seq = my_string(read.rc, read_len);
+        seq_rc = my_string(read.seq, read_len);
+    } else {
+        seq = my_string(read.seq, read_len);
+        seq_rc = my_string(read.rc, read_len);
+    }
+    my_string read_start_kmer = seq.substr(nam.query_start, k);
+    my_string read_end_kmer = seq.substr(nam.query_end - k, k);
+//    printf("read_start_kmer: ");
+//    print_str(read_start_kmer);
+//    printf("read_end_kmer: ");
+//    print_str(read_end_kmer);
+    if (ref_start_kmer == read_start_kmer && ref_end_kmer == read_end_kmer) {
+        return true;
+    }
+
+    // False forward or false reverse (possible due to symmetrical hash values)
+    //    we need two extra checks for this - hopefully this will remove all the false hits we see (true hash collisions should be very few)
+    int q_start_tmp = read_len - nam.query_end;
+    int q_end_tmp = read_len - nam.query_start;
+    // false reverse hit, change coordinates in nam to forward
+    read_start_kmer = seq_rc.substr(q_start_tmp, k);
+    read_end_kmer = seq_rc.substr(q_end_tmp - k, k);
+    if (ref_start_kmer == read_start_kmer && ref_end_kmer == read_end_kmer) {
+        nam.is_rc = !nam.is_rc;
+        nam.query_start = q_start_tmp;
+        nam.query_end = q_end_tmp;
+        return true;
+    }
+    return false;
+}
+
+__device__ void rescue_read_part(
+        int flag,
+        GPUAlignTmpRes& align_tmp_res,
+        const GPURead& read2,  // read to be rescued
+        const GPURead& read1,  // read that has NAMs
+        const AlignmentParameters& aligner_parameters,
+        const GPUReferences& references,
+        my_vector<Nam>& nams1,
+        int max_tries,
+        float dropoff,
+        int k,
+        float mu,
+        float sigma,
+        size_t max_secondary,
+        double secondary_dropoff,
+        bool swap_r1r2
+) {
+    //align_tmp_res.type = flag;
+    Nam n_max1 = nams1[0];
+    int tries = 0;
+    // this loop is safe, loop size is stable
+    for (int i = 0; i < nams1.size(); i++) {
+        Nam &nam = nams1[i];
+        float score_dropoff1 = (float) nam.n_hits / n_max1.n_hits;
+        // only consider top hits (as minimap2 does) and break if below dropoff cutoff.
+        if (tries >= max_tries || score_dropoff1 < dropoff) {
+            break;
+        }
+
+        const bool consistent_nam = reverse_nam_if_needed(nam, read1, references, k);
+        // reserve extend and store info
+        if(flag == 1) align_tmp_res.is_read1.push_back(true);
+        else align_tmp_res.is_read1.push_back(false);
+        bool gapped = extend_seed_part(align_tmp_res, aligner_parameters, nam, references, read1, consistent_nam);
+
+        // Force SW alignment to rescue mate
+        if(flag == 1) align_tmp_res.is_read1.push_back(false);
+        else align_tmp_res.is_read1.push_back(true);
+        bool is_unaligned = rescue_mate_part(align_tmp_res, aligner_parameters, nam, references, read2, mu, sigma, k);
+        tries++;
+    }
+}
+
+__device__ bool is_proper_nam_pair(const Nam nam1, const Nam nam2, float mu, float sigma) {
+    if (nam1.ref_id != nam2.ref_id || nam1.is_rc == nam2.is_rc) {
+        return false;
+    }
+    int a = my_max(0, nam1.ref_start - nam1.query_start);
+    int b = my_max(0, nam2.ref_start - nam2.query_start);
+
+    // r1 ---> <---- r2
+    bool r1_r2 = nam2.is_rc && (a <= b) && (b - a < mu + 10 * sigma);
+    if(r1_r2) return 1;
+
+    // r2 ---> <---- r1
+    bool r2_r1 = nam1.is_rc && (b <= a) && (a - b < mu + 10 * sigma);
+    if(r2_r1) return 1;
+    return 0;
+
+//    return r1_r2 || r2_r1;
+}
+
+__device__ float top_dropoff(my_vector<Nam>& nams) {
+    auto& n_max = nams[0];
+    if (n_max.n_hits <= 2) {
+        return 1.0;
+    }
+    if (nams.size() > 1) {
+        return (float) nams[1].n_hits / n_max.n_hits;
+    }
+    return 0.0;
+}
+
+__device__ uint8_t get_mapq(const my_vector<Nam>& nams, const Nam& n_max) {
+    if (nams.size() <= 1) {
+        return 60;
+    }
+    const float s1 = n_max.score;
+    const float s2 = nams[1].score;
+    // from minimap2: MAPQ = 40(1−s2/s1) ·min{1,|M|/10} · log s1
+    const float min_matches = my_min(n_max.n_hits / 10.0, 1.0);
+    const int uncapped_mapq = 40 * (1 - s2 / s1) * min_matches * log(s1);
+    return my_min(uncapped_mapq, 60);
+}
+
+__device__ bool is_proper_pair(const GPUAlignment& alignment1, const GPUAlignment& alignment2, float mu, float sigma) {
+    const int dist = alignment2.ref_start - alignment1.ref_start;
+    const bool same_reference = alignment1.ref_id == alignment2.ref_id;
+    const bool both_aligned = same_reference && !alignment1.is_unaligned && !alignment2.is_unaligned;
+    const bool r1_r2 = !alignment1.is_rc && alignment2.is_rc && dist >= 0; // r1 ---> <---- r2
+    const bool r2_r1 = !alignment2.is_rc && alignment1.is_rc && dist <= 0; // r2 ---> <---- r1
+    const bool rel_orientation_good = r1_r2 || r2_r1;
+    const bool insert_good = std::abs(dist) <= mu + 6 * sigma;
+
+    return both_aligned && insert_good && rel_orientation_good;
+}
+
+struct GPUInsertSizeDistribution {
+    float sample_size = 1;
+    float mu = 300;
+    float sigma = 100;
+    float V = 10000;
+    float SSE = 10000;
+
+    // Add a new observation
+    __device__ void update(int dist) {
+        if (dist >= 2000) {
+            return;
+        }
+        const float e = dist - mu;
+        mu += e / sample_size;  // (1.0/(sample_size +1.0)) * (sample_size*mu + d);
+        SSE += e * (dist - mu);
+        if (sample_size > 1) {
+            //d < 1000 ? ((sample_size +1.0)/sample_size) * ( (V*sample_size/(sample_size +1)) + ((mu-d)*(mu-d))/sample_size ) : V;
+            V = SSE / (sample_size - 1.0);
+        } else {
+            V = SSE;
+        }
+        sigma = sqrtf(V);
+        sample_size = sample_size + 1.0;
+        if (mu < 0) {
+            printf("mu negative, mu: %f sigma: %f SSE: %f sample size: %f\n", mu, sigma, SSE, sample_size);
+            assert(false);
+        }
+        if (SSE < 0) {
+            printf("SSE negative, mu: %f sigma: %f SSE: %f sample size: %f\n", mu, sigma, SSE, sample_size);
+            assert(false);
+        }
+    }
+};
+
+
+struct NamPair {
+    int score;
+    Nam nam1;
+    Nam nam2;
+};
+
+__device__ my_vector<NamPair> get_best_scoring_nam_pairs(
+        const my_vector<Nam>& nams1,
+        const my_vector<Nam>& nams2,
+        float mu,
+        float sigma
+) {
+    my_vector<NamPair> joint_nam_scores;
+    if (nams1.empty() && nams2.empty()) {
+        return joint_nam_scores;
+    }
+
+    my_vector<bool> added_n1(nams1.size());
+    my_vector<bool> added_n2(nams2.size());
+    for(int i = 0; i < nams1.size(); i++) added_n1[i] = false;
+    for(int i = 0; i < nams2.size(); i++) added_n2[i] = false;
+
+//    robin_hood::unordered_set<int> added_n1;
+//    robin_hood::unordered_set<int> added_n2;
+    int best_joint_hits = 0;
+
+
+    my_vector<Nam> nams2_sorted[2];
+//    for(auto nam2 : nams2) {
+    for(int i = 0; i < nams2.size(); i++) {
+        auto nam2 = nams2[i];
+        nams2_sorted[nam2.is_rc].push_back(nam2);
+    }
+
+//    printf("before sort\n");
+//    for(int i = 0; i < nams2.size(); i++) {
+//        print_nam(nams2[i]);
+//    }
+
+    for(int id = 0; id < 2; id++) {
+//        quick_sort_iterative(&(nams2_sorted[i][0]), 0, nams2_sorted[i].size(), [](const Nam &n1, const Nam &n2) {
+//            int val1 = my_max(0, n1.ref_start - n1.query_start);
+//            int val2 = my_max(0, n2.ref_start - n2.query_start);
+//            return val1 < val2;
+//        });
+        Nam* data = &(nams2_sorted[id][0]);
+        int size = nams2_sorted[id].size();
+        for (int i = 0; i < size - 1; ++i) {
+            for (int j = 0; j < size - i - 1; ++j) {
+                Nam n1 = data[j];
+                Nam n2 = data[j + 1];
+                int val1 = my_max(0, n1.ref_start - n1.query_start);
+                int val2 = my_max(0, n2.ref_start - n2.query_start);
+                if (val1 > val2) {
+                    Nam temp = data[j];
+                    data[j] = data[j + 1];
+                    data[j + 1] = temp;
+                }
+            }
+        }
+    }
+//    printf("sorted nams\n");
+//    for(int i = 0; i < 2; i++) {
+//        for(int j = 0; j < nams2_sorted[i].size(); j++) {
+//            print_nam(nams2_sorted[i][j]);
+//        }
+//        printf("\n\n");
+//    }
+
+
+
+//    for (auto& nam1 : nams1) {
+    for(int i = 0; i < nams1.size(); i++) {
+        auto &nam1 = nams1[i];
+        int nam1_val = my_max(0, nam1.ref_start - nam1.query_start);
+        if(nam1.is_rc == 1) {
+            float L_val = nam1_val - (mu + 10 * sigma);
+            float R_val = nam1_val;
+            int ll = 0, rr = nams2_sorted[0].size() - 1, ans_pos = nams2_sorted[0].size();
+            while(ll <= rr) {
+                int mid  = (ll + rr) / 2;
+                int now_val = my_max(0, nams2_sorted[0][mid].ref_start - nams2_sorted[0][mid].query_start);
+                if(now_val > L_val) {
+                    rr = mid - 1;
+                    ans_pos = mid;
+                } else {
+                    ll = mid + 1;
+                }
+            }
+
+            for (int id = ans_pos; id < nams2_sorted[0].size(); id++) {
+                Nam nam2 = nams2_sorted[0][id];
+                int joint_hits = nam1.n_hits + nam2.n_hits;
+                if(nam1.ref_id != nam2.ref_id) continue;
+                int a = my_max(0, nam1.ref_start - nam1.query_start);
+                int b = my_max(0, nam2.ref_start - nam2.query_start);
+                if(b > R_val - 1e-6) break;
+
+                // nam1 is rec, nam2 is fwd
+
+                //// r1 ---> <---- r2
+                //bool r1_r2 = nam2.is_rc && (a <= b) && (b - a < mu + 10 * sigma);
+
+                // r2 ---> <---- r1
+                bool r2_r1 = (a - b >= 0) && (a - b < mu + 10 * sigma);
+
+                if (r2_r1) {
+                    joint_nam_scores.push_back(NamPair{joint_hits, nam1, nam2});
+                    added_n1[nam1.nam_id] = 1;
+                    added_n2[nam2.nam_id] = 1;
+//                    added_n1.insert(nam1.nam_id);
+//                    added_n2.insert(nam2.nam_id);
+                    //best_joint_hits = my_max(joint_hits, best_joint_hits);
+                }
+            }
+        } else{
+            float L_val = nam1_val;
+            float R_val = nam1_val + mu + 10 * sigma;
+            int ll = 0, rr = nams2_sorted[1].size() - 1, ans_pos = nams2_sorted[1].size();
+            while(ll <= rr) {
+                int mid  = (ll + rr) / 2;
+                int now_val = my_max(0, nams2_sorted[1][mid].ref_start - nams2_sorted[1][mid].query_start);
+                if(now_val >= L_val) {
+                    rr = mid - 1;
+                    ans_pos = mid;
+                } else {
+                    ll = mid + 1;
+                }
+            }
+
+            for (int id = ans_pos; id < nams2_sorted[1].size(); id++) {
+                Nam nam2 = nams2_sorted[1][id];
+                int joint_hits = nam1.n_hits + nam2.n_hits;
+                if(nam1.ref_id != nam2.ref_id) continue;
+
+                int a = my_max(0, nam1.ref_start - nam1.query_start);
+                int b = my_max(0, nam2.ref_start - nam2.query_start);
+                if(b >= R_val - 1e-6) break;
+
+                // nam1 is fwd, nam2 is rec
+
+                // r1 ---> <---- r2
+                bool r1_r2 = (b - a >= 0) && (b - a < mu + 10 * sigma);
+
+                if (r1_r2) {
+                    joint_nam_scores.push_back(NamPair{joint_hits, nam1, nam2});
+                    added_n1[nam1.nam_id] = 1;
+                    added_n2[nam2.nam_id] = 1;
+//                    added_n1.insert(nam1.nam_id);
+//                    added_n2.insert(nam2.nam_id);
+                }
+            }
+        }
+
+    }
+
+//    printf("joint_nam_scores : %d\n", joint_nam_scores.size());
+
+
+
+    // Find high-scoring R1 NAMs that are not part of a proper pair
+    Nam dummy_nam;
+    dummy_nam.ref_start = -1;
+    if (!nams1.empty()) {
+        int best_joint_hits1 = best_joint_hits > 0 ? best_joint_hits : nams1[0].n_hits;
+//        for (auto& nam1 : nams1) {
+        for(int i = 0; i < nams1.size(); i++) {
+            auto& nam1 = nams1[i];
+            if (nam1.n_hits < best_joint_hits1 / 2) {
+                break;
+            }
+//            if (added_n1.find(nam1.nam_id) != added_n1.end()) {
+            if (added_n1[nam1.nam_id]) {
+                continue;
+            }
+            //            int n1_penalty = std::abs(nam1.query_span() - nam1.ref_span());
+            joint_nam_scores.push_back(NamPair{nam1.n_hits, nam1, dummy_nam});
+        }
+    }
+
+
+    // Find high-scoring R2 NAMs that are not part of a proper pair
+    if (!nams2.empty()) {
+        int best_joint_hits2 = best_joint_hits > 0 ? best_joint_hits : nams2[0].n_hits;
+//        for (auto& nam2 : nams2) {
+        for(int i = 0; i < nams2.size(); i++) {
+            auto& nam2 = nams2[i];
+            if (nam2.n_hits < best_joint_hits2 / 2) {
+                break;
+            }
+//            if (added_n2.find(nam2.nam_id) != added_n2.end()) {
+            if (added_n2[nam2.nam_id]) {
+                continue;
+            }
+            //            int n2_penalty = std::abs(nam2.query_span() - nam2.ref_span());
+            joint_nam_scores.push_back(NamPair{nam2.n_hits, dummy_nam, nam2});
+        }
+    }
+
+
+//    printf("joint_nam_scores : %d\n", joint_nam_scores.size());
+//    for(int i = 0; i < joint_nam_scores.size(); i++) {
+//        printf("score: %d\n", joint_nam_scores[i].score);
+//        print_nam(joint_nam_scores[i].nam1);
+//        print_nam(joint_nam_scores[i].nam2);
+//    }
+
+
+
+//    quick_sort_iterative(&(joint_nam_scores[0]), 0, joint_nam_scores.size(), [](const NamPair &n1, const NamPair &n2) {
+//        return n1.score > n2.score;
+//    });
+
+    NamPair* data = &(joint_nam_scores[0]);
+    int size = joint_nam_scores.size();
+    for (int i = 0; i < size - 1; ++i) {
+        for (int j = 0; j < size - i - 1; ++j) {
+            NamPair n1 = data[j];
+            NamPair n2 = data[j + 1];
+            if (n1.score < n2.score) {
+                NamPair temp = data[j];
+                data[j] = data[j + 1];
+                data[j + 1] = temp;
+            }
+        }
+    }
+
+
+//    printf("sorted joint_nam_scores : %d\n", joint_nam_scores.size());
+//    for(int i = 0; i < joint_nam_scores.size(); i++) {
+//        printf("score: %d\n", joint_nam_scores[i].score);
+//        print_nam(joint_nam_scores[i].nam1);
+//        print_nam(joint_nam_scores[i].nam2);
+//    }
+
+    return joint_nam_scores;
+}
+
+__device__ static unsigned char revcomp_table[256] = {
+        'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',
+        'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',
+        'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',
+        'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',
+        'N', 'T', 'N', 'G',  'N', 'N', 'N', 'C',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',
+        'N', 'N', 'N', 'N',  'A', 'A', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',
+        'N', 'T', 'N', 'G',  'N', 'N', 'N', 'C',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',
+        'N', 'N', 'N', 'N',  'A', 'A', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',
+        'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',
+        'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',
+        'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',
+        'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',
+        'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',
+        'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',
+        'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',
+        'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N',  'N', 'N', 'N', 'N'
+};
+
+struct GPUScoredAlignmentPair {
+    double score;
+    GPUAlignment alignment1;
+    GPUAlignment alignment2;
+};
+
+
+
+__device__ void align_PE_part(
+        GPUAlignTmpRes& align_tmp_res,
+        const AlignmentParameters& aligner_parameters,
+        my_vector<Nam>& nams1,
+        my_vector<Nam>& nams2,
+        char* seq1, int seq_len1,
+        char* seq2, int seq_len2,
+        int k,
+        const GPUReferences& references,
+        float dropoff,
+        GPUInsertSizeDistribution& isize_est,
+        unsigned max_tries,
+        size_t max_secondary
+) {
+    const auto mu = isize_est.mu;
+    const auto sigma = isize_est.sigma;
+    char* rc1 = (char*)my_malloc(seq_len1 + 1);
+    char* rc2 = (char*)my_malloc(seq_len2 + 1);
+    for(int i = 0; i < seq_len1; i++) {
+        rc1[i] = revcomp_table[static_cast<int>(seq1[seq_len1 - i - 1])];
+    }
+    for(int i = 0; i < seq_len2; i++) {
+        rc2[i] = revcomp_table[static_cast<int>(seq2[seq_len2 - i - 1])];
+    }
+    GPURead read1{seq1, rc1, seq_len1};
+    GPURead read2{seq2, rc2, seq_len2};
+    double secondary_dropoff = 2 * aligner_parameters.mismatch + aligner_parameters.gap_open;
+
+//    printf("nams1 : %d\n", nams1.size());
+//    for(int i = 0; i < nams1.size(); i++) {
+//        print_nam(nams1[i]);
+//    }
+//    printf("nams2 : %d\n", nams2.size());
+//    for(int i = 0; i < nams2.size(); i++) {
+//        print_nam(nams2[i]);
+//    }
+//
+//    printf("seq1 : %d ", read1.length);
+//    print_str(my_string(read1.seq, read1.length));
+//    print_str(my_string(read1.rc, read1.length));
+//    printf("seq2 : %d ", read2.length);
+//    print_str(my_string(read2.seq, read2.length));
+//    print_str(my_string(read2.rc, read2.length));
+
+    //align_tmp_res.type = 1;
+    //align_tmp_res.type4_loop_size = 1;
+    //my_free(rc1);
+    //my_free(rc2);
+    //return;
+
+
+    if (nams1.empty() && nams2.empty()) {
+        // None of the reads have any NAMs
+        align_tmp_res.type = 0;
+        align_tmp_res.type4_loop_size = 0;
+        my_free(rc1);
+        my_free(rc2);
+        return;
+    } 
+
+    if (!nams1.empty() && nams2.empty()) {
+        // Only read 1 has NAMS: attempt to rescue read 2
+        align_tmp_res.type = 1;
+        align_tmp_res.type4_loop_size = 0;
+        //rescue_read_part(
+        //        1, align_tmp_res, read2, read1, aligner_parameters, references, nams1, max_tries, dropoff, k, mu,
+        //        sigma, max_secondary, secondary_dropoff, false
+        //);
+        my_free(rc1);
+        my_free(rc2);
+        return;
+    }
+
+    if (nams1.empty() && !nams2.empty()) {
+        // Only read 2 has NAMS: attempt to rescue read 1
+        align_tmp_res.type = 2;
+        align_tmp_res.type4_loop_size = 0;
+        //rescue_read_part(
+        //        2, align_tmp_res, read1, read2, aligner_parameters, references, nams2, max_tries, dropoff, k, mu,
+        //        sigma, max_secondary, secondary_dropoff, true
+        //);
+        my_free(rc1);
+        my_free(rc2);
+        return;
+    }
+
+    //align_tmp_res.type = 3;
+    //align_tmp_res.type4_loop_size = 0;
+    //my_free(rc1);
+    //my_free(rc2);
+    //return;
+
+
+    //    printf("type3\n");
+
+    // If we get here, both reads have NAMs
+    assert(!nams1.empty() && !nams2.empty());
+
+    // Deal with the typical case that both reads map uniquely and form a proper pair
+    if (top_dropoff(nams1) < dropoff && top_dropoff(nams2) < dropoff &&
+        is_proper_nam_pair(nams1[0], nams2[0], mu, sigma)) {
+        align_tmp_res.type = 3;
+        Nam n_max1 = nams1[0];
+        Nam n_max2 = nams2[0];
+
+//        printf("n_max1:\n");
+//        print_nam(n_max1);
+//        printf("n_max2:\n");
+//        print_nam(n_max2);
+
+        bool consistent_nam1 = reverse_nam_if_needed(n_max1, read1, references, k);
+        bool consistent_nam2 = reverse_nam_if_needed(n_max2, read2, references, k);
+
+        align_tmp_res.is_read1.push_back(true);
+        bool gapped1 = extend_seed_part(align_tmp_res, aligner_parameters, n_max1, references, read1, consistent_nam1);
+
+
+        align_tmp_res.is_read1.push_back(false);
+        bool gapped2 = extend_seed_part(align_tmp_res, aligner_parameters, n_max2, references, read2, consistent_nam2);
+
+        int mapq1 = get_mapq(nams1, n_max1);
+        int mapq2 = get_mapq(nams2, n_max2);
+        align_tmp_res.mapq1 = mapq1;
+        align_tmp_res.mapq2 = mapq2;
+
+
+        if(!gapped1 && !gapped2) {
+            int res_size = align_tmp_res.align_res.size();
+            if(res_size < 2) {
+                printf("align_tmp_res.align_res.size error %d\n", res_size);
+                assert(false);
+            }
+            auto alignment1 = align_tmp_res.align_res[res_size - 2];
+            auto alignment2 = align_tmp_res.align_res[res_size - 1];
+            if(alignment1.gapped || alignment2.gapped) {
+                printf("alignment gapped error\n");
+                assert(false);
+            }
+            bool is_proper = is_proper_pair(alignment1, alignment2, mu, sigma);
+            if ((isize_est.sample_size < 400) && (alignment1.edit_distance + alignment2.edit_distance < 3) && is_proper) {
+                isize_est.update(my_abs(alignment1.ref_start - alignment2.ref_start));
+            }
+        }
+        align_tmp_res.type = 3 + gapped1 + gapped2;
+        align_tmp_res.type4_loop_size = 0;
+        my_free(rc1);
+        my_free(rc2);
+        
+        return;
+    }
+
+//    printf("type4\n");
+
+    align_tmp_res.type = 4;
+    align_tmp_res.type4_loop_size = 0;
+    my_free(rc1);
+    my_free(rc2);
+    return;
+
+    my_vector<NamPair> joint_nam_scores = get_best_scoring_nam_pairs(nams1, nams2, mu, sigma);
+
+    my_vector<bool> is_aligned1(nams1.size());
+    my_vector<bool> is_aligned2(nams2.size());
+    for (int i = 0; i < nams1.size(); i++) is_aligned1[i] = 0;
+    for (int i = 0; i < nams2.size(); i++) is_aligned2[i] = 0;
+
+    {
+        auto n1_max = nams1[0];
+        bool consistent_nam1 = reverse_nam_if_needed(n1_max, read1, references, k);
+        align_tmp_res.is_read1.push_back(true);
+        bool gapped1 = extend_seed_part(align_tmp_res, aligner_parameters, n1_max, references, read1, consistent_nam1);
+        is_aligned1[n1_max.nam_id] = 1;
+
+        auto n2_max = nams2[0];
+        bool consistent_nam2 = reverse_nam_if_needed(n2_max, read2, references, k);
+        align_tmp_res.is_read1.push_back(false);
+        bool gapped2 = extend_seed_part(align_tmp_res, aligner_parameters, n2_max, references, read2, consistent_nam2);
+        is_aligned2[n2_max.nam_id] = 1;
+    }
+
+    // Turn pairs of high-scoring NAMs into pairs of alignments
+    my_vector<GPUScoredAlignmentPair> high_scores;
+    auto max_score = joint_nam_scores[0].score;
+    align_tmp_res.type4_loop_size = 0;
+//    for (auto& [score_, n1, n2] : joint_nam_scores) {
+    for(int i = 0; i < joint_nam_scores.size(); i++) {
+        auto score_ = joint_nam_scores[i].score;
+        auto n1 = joint_nam_scores[i].nam1;
+        auto n2 = joint_nam_scores[i].nam2;
+        float score_dropoff = (float) score_ / max_score;
+        if (high_scores.size() >= max_tries || score_dropoff < dropoff) {
+            break;
+        }
+
+        align_tmp_res.type4_nams.push_back(n1);
+        align_tmp_res.type4_nams.push_back(n2);
+        align_tmp_res.type4_loop_size++;
+
+        if (n1.ref_start >= 0) {
+            if (is_aligned1[n1.nam_id] == 1) {
+
+            } else {
+                bool consistent_nam = reverse_nam_if_needed(n1, read1, references, k);
+                align_tmp_res.is_read1.push_back(true);
+                bool gapped = extend_seed_part(align_tmp_res, aligner_parameters, n1, references, read1, consistent_nam);
+                is_aligned1[n1.nam_id] = 1;
+            }
+        } else {
+            align_tmp_res.is_read1.push_back(true);
+            bool is_unaligned = rescue_mate_part(align_tmp_res, aligner_parameters, n2, references, read1, mu, sigma, k);
+
+        }
+
+        // ref_start == -1 is a marker for a dummy NAM
+        if (n2.ref_start >= 0) {
+            if (is_aligned2[n2.nam_id] == 1) {
+
+            } else {
+                bool consistent_nam = reverse_nam_if_needed(n2, read2, references, k);
+                align_tmp_res.is_read1.push_back(false);
+                bool gapped = extend_seed_part(align_tmp_res, aligner_parameters, n2, references, read2, consistent_nam);
+                is_aligned2[n2.nam_id] = 1;
+            }
+        } else {
+            align_tmp_res.is_read1.push_back(false);
+            bool is_unaligned = rescue_mate_part(align_tmp_res, aligner_parameters, n1, references, read2, mu, sigma, k);
+        }
+        GPUScoredAlignmentPair aln_pair;
+        high_scores.push_back(aln_pair);
+    }
+
+    my_free(rc1);
+    my_free(rc2);
+}
 
 #define BLOCK_SIZE 32
 
@@ -398,6 +1455,7 @@ __device__ void sort_hits_parallel(
         int tid
 ) {
     if(hits_per_ref.size() == 0) return;
+    /*
     int num_hits = hits_per_ref.size();
 
     const int items_per_thread = 160;
@@ -457,6 +1515,8 @@ __device__ void sort_hits_parallel(
         my_free(old_ref_end);
         my_free(old_query_end);
     }
+    */
+
 
 }
 
@@ -498,13 +1558,13 @@ __device__ void salign_merge_hits(
     }
     ref_num++;
     each_ref_size.push_back(now_ref_num);
-    int mx_hits_per_ref = 0;
-    for (int i = 0; i < each_ref_size.size(); i++) {
-        mx_hits_per_ref = my_max(mx_hits_per_ref, each_ref_size[i]);
-    }
+    //int mx_hits_per_ref = 0;
+    //for (int i = 0; i < each_ref_size.size(); i++) {
+    //    mx_hits_per_ref = my_max(mx_hits_per_ref, each_ref_size[i]);
+    //}
 
-    my_vector<Nam> open_nams(mx_hits_per_ref);
-    my_vector<bool> is_added(mx_hits_per_ref);
+    my_vector<Nam> open_nams;
+    //(mx_hits_per_ref);
 
     int now_vec_pos = 0;
     for (int rid = 0; rid < ref_num; rid++) {
@@ -521,7 +1581,8 @@ __device__ void salign_merge_hits(
             while(i_end < hits_size && hits[i_end].second.query_start == hits[i].second.query_start) i_end++;
             i = i_end;
             i_size = i_end - i_start;
-            for(int j = 0; j < i_size; j++) is_added[j] = false;
+            my_vector<bool> is_added(i_size);
+            for(size_t j = 0; j < i_size; j++) is_added.push_back(false);
             int query_start = hits[i_start].second.query_start;
             int cnt_done = 0;
             for (int k = 0; k < open_nams.size(); k++) {
@@ -1102,6 +2163,14 @@ __global__ void gpu_rescue_get_hits(
     int r_range = l_range + GPU_thread_task_size;
     if (r_range > num_tasks) r_range = num_tasks;
     for (int id = l_range; id < r_range; id++) {
+        my_vector<my_pair<int, Hit>>* hits_per_ref0;
+        my_vector<my_pair<int, Hit>>* hits_per_ref1;
+        hits_per_ref0 = (my_vector<my_pair<int, Hit>>*)my_malloc(sizeof(my_vector<my_pair<int, Hit>>));
+        hits_per_ref1 = (my_vector<my_pair<int, Hit>>*)my_malloc(sizeof(my_vector<my_pair<int, Hit>>));
+        hits_per_ref0->init();
+        hits_per_ref1->init();
+
+
         my_vector<RescueHit> hits_t0;
         my_vector<RescueHit> hits_t1;
         for (int i = 0; i < global_randstrobes[id].size(); i++) {
@@ -1109,6 +2178,10 @@ __global__ void gpu_rescue_get_hits(
             //size_t position = gpu_find(d_randstrobes, d_randstrobe_start_indices, q.hash, bits);
             size_t position = q.hash;
             if (position != static_cast<size_t>(-1)) {
+                if(position >= d_randstrobes_size) {
+                    printf("position > d_randstrobes_size : %llu %llu\n", position, d_randstrobes_size);
+                    assert(false);
+                }
                 unsigned int count = gpu_get_count(d_randstrobes, d_randstrobe_start_indices, position, bits);
                 RescueHit rh{position, count, q.start, q.end};
                 if(q.is_reverse) hits_t1.push_back(rh);
@@ -1117,35 +2190,27 @@ __global__ void gpu_rescue_get_hits(
         }
         global_randstrobes[id].release();
         quick_sort(&(hits_t0[0]), hits_t0.size());
-        quick_sort(&(hits_t1[0]), hits_t1.size());
 
-        my_vector<my_pair<int, Hit>>* hits_per_ref0;
-        my_vector<my_pair<int, Hit>>* hits_per_ref1;
-        hits_per_ref0 = (my_vector<my_pair<int, Hit>>*)my_malloc(sizeof(my_vector<my_pair<int, Hit>>));
-        hits_per_ref1 = (my_vector<my_pair<int, Hit>>*)my_malloc(sizeof(my_vector<my_pair<int, Hit>>));
-        hits_per_ref0->init(128);
-        hits_per_ref1->init(128);
-
-        int cnt0 = 0;
+        int cnt = 0;
         for (int i = 0; i < hits_t0.size(); i++) {
             RescueHit &rh = hits_t0[i];
-            if ((rh.count > rescue_cutoff && cnt0 >= 5) || rh.count > rescue_threshold) {
+            if ((rh.count > rescue_cutoff && cnt >= 5) || rh.count > rescue_threshold) {
                 break;
             }
             add_to_hits_per_ref(*hits_per_ref0, rh.query_start, rh.query_end, rh.position, d_randstrobes, d_randstrobes_size, index_para->syncmer.k);
-            cnt0++;
+            cnt++;
         }
-
-        int cnt1 = 0;
+        quick_sort(&(hits_t1[0]), hits_t1.size());
+        cnt = 0;
         for (int i = 0; i < hits_t1.size(); i++) {
             RescueHit &rh = hits_t1[i];
-            if ((rh.count > rescue_cutoff && cnt1 >= 5) || rh.count > rescue_threshold) {
+            if ((rh.count > rescue_cutoff && cnt >= 5) || rh.count > rescue_threshold) {
                 break;
             }
             add_to_hits_per_ref(*hits_per_ref1, rh.query_start, rh.query_end, rh.position, d_randstrobes, d_randstrobes_size, index_para->syncmer.k);
-            cnt1++;
+            cnt++;
         }
-        global_hits_num[id] = hits_per_ref0->size() + hits_per_ref1->size() + cnt0 + cnt1;
+        global_hits_num[id] = hits_per_ref0->size() + hits_per_ref1->size();
         hits_per_ref0s[id] = *hits_per_ref0;
         hits_per_ref1s[id] = *hits_per_ref1;
         my_free(hits_per_ref0);
@@ -1481,6 +2546,10 @@ __global__ void gpu_get_hits_pre(
         for (int i = 0; i < global_randstrobes[id].size(); i++) {
             QueryRandstrobe q = global_randstrobes[id][i];
             size_t position = gpu_find(d_randstrobes, d_randstrobe_start_indices, q.hash, bits);
+            //if(position != static_cast<size_t>(-1) && position >= d_randstrobes_size) {
+            //    printf("position GG %zu %zu\n", position, d_randstrobes_size);
+            //    assert(false);
+            //}
             global_randstrobes[id][i].hash = position;
         }
     }
@@ -1714,6 +2783,7 @@ __global__ void gpu_sort_hits(
     }
 }
 
+
 __global__ void gpu_merge_hits(
         int num_tasks,
         IndexParameters *index_para,
@@ -1728,7 +2798,7 @@ __global__ void gpu_merge_hits(
     int r_range = l_range + GPU_thread_task_size;
     if (r_range > num_tasks) r_range = num_tasks;
     for (int id = l_range; id < r_range; id++) {
-        my_vector<Nam> nams(32);
+        my_vector<Nam> nams;
         salign_merge_hits(hits_per_ref0s[id], index_para->syncmer.k, 0, nams);
         salign_merge_hits(hits_per_ref1s[id], index_para->syncmer.k, 1, nams);
         uint64_t local_nams_info = 0;
@@ -1738,6 +2808,82 @@ __global__ void gpu_merge_hits(
         global_nams_info[id] += local_nams_info;
         hits_per_ref0s[id].release();
         hits_per_ref1s[id].release();
+    }
+}
+
+__global__ void gpu_merge_hits2(
+        int num_tasks,
+        IndexParameters *index_para,
+        uint64_t *global_nams_info,
+        my_vector<my_pair<int, Hit>>* hits_per_ref0s,
+        my_vector<my_pair<int, Hit>>* hits_per_ref1s,
+        AlignmentParameters* aligner_parameters,
+        int *pre_sum,
+        int *lens,
+        char *all_seqs,
+        int *pre_sum2,
+        int *lens2,
+        char *all_seqs2,
+        GPUReferences *global_references,
+        MappingParameters *mapping_parameters
+) {
+    int global_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int l_range = global_id * GPU_thread_task_size;
+    int r_range = l_range + GPU_thread_task_size;
+    if (r_range > num_tasks) r_range = num_tasks;
+    for (int id = l_range; id < r_range; id++) {
+        int real_id = id;
+        my_vector<Nam> nams1;
+        salign_merge_hits(hits_per_ref0s[real_id], index_para->syncmer.k, 0, nams1);
+        salign_merge_hits(hits_per_ref1s[real_id], index_para->syncmer.k, 1, nams1);
+        uint64_t local_nams_info = 0;
+        for (int i = 0; i < nams1.size(); i++) {
+            local_nams_info += nams1[i].ref_id + int(nams1[i].score) + nams1[i].query_start + nams1[i].query_end;
+            //local_nams_info += 1;
+        }
+        global_nams_info[real_id] += local_nams_info;
+        hits_per_ref0s[real_id].release();
+        hits_per_ref1s[real_id].release();
+
+        real_id = id + num_tasks;
+        my_vector<Nam> nams2;
+        salign_merge_hits(hits_per_ref0s[real_id], index_para->syncmer.k, 0, nams2);
+        salign_merge_hits(hits_per_ref1s[real_id], index_para->syncmer.k, 1, nams2);
+        local_nams_info = 0;
+        for (int i = 0; i < nams2.size(); i++) {
+            local_nams_info += nams2[i].ref_id + int(nams2[i].score) + nams2[i].query_start + nams2[i].query_end;
+            //local_nams_info += 1;
+        }
+        global_nams_info[real_id] += local_nams_info;
+        hits_per_ref0s[real_id].release();
+        hits_per_ref1s[real_id].release();
+
+        size_t seq_len1, seq_len2;
+        char *seq1, *seq2;
+        seq_len1 = lens[id];
+        seq1 = all_seqs + pre_sum[id];
+        seq_len2 = lens2[id];
+        seq2 = all_seqs2 + pre_sum2[id];
+
+        GPUAlignTmpRes align_tmp_res;
+        GPUInsertSizeDistribution isize_est;
+        align_PE_part(align_tmp_res, *aligner_parameters, nams1, nams2, seq1, seq_len1, seq2, seq_len2, index_para->syncmer.k, *global_references,
+                      mapping_parameters->dropoff_threshold, isize_est, mapping_parameters->max_tries, mapping_parameters->max_secondary);
+        global_nams_info[id] += align_tmp_res.type + align_tmp_res.type4_loop_size;
+        //global_nams_info[id] += 100;
+        //assert(false);
+        //for(int i = 0; i < align_tmp_res.align_res.size(); i++) {
+        //    align_tmp_res.align_res[i].cigar.release();
+        //}
+        //align_tmp_res.align_res.release();
+        //align_tmp_res.is_extend_seed.release();
+        //align_tmp_res.consistent_nam.release();
+        //align_tmp_res.is_read1.release();
+        //align_tmp_res.type4_nams.release();
+        //align_tmp_res.todo_nams.release();
+        //align_tmp_res.done_align.release();
     }
 }
 
@@ -1875,6 +3021,33 @@ int main(int argc, char **argv) {
             opt.c_set ? opt.c : IndexParameters::DEFAULT,
             opt.max_seed_len_set ? opt.max_seed_len : IndexParameters::DEFAULT
     );
+    AlignmentParameters aln_params;
+    aln_params.match = opt.A;
+    aln_params.mismatch = opt.B;
+    aln_params.gap_open = opt.O;
+    aln_params.gap_extend = opt.E;
+    aln_params.end_bonus = opt.end_bonus;
+
+    AlignmentParameters *d_aligner;
+    cudaMalloc(&d_aligner, sizeof(AlignmentParameters));
+    cudaMemcpy(d_aligner, &aln_params, sizeof(AlignmentParameters), cudaMemcpyHostToDevice);
+
+
+    MappingParameters map_param;
+    map_param.r = opt.r;
+    map_param.max_secondary = opt.max_secondary;
+    map_param.dropoff_threshold = opt.dropoff_threshold;
+    map_param.rescue_level = opt.rescue_level;
+    map_param.max_tries = opt.max_tries;
+    map_param.is_sam_out = opt.is_sam_out;
+    map_param.cigar_ops = opt.cigar_eqx ? CigarOps::EQX : CigarOps::M;
+    map_param.output_unmapped = opt.output_unmapped;
+    map_param.details = opt.details;
+    map_param.verify();
+
+    MappingParameters* d_map_param;
+    cudaMalloc(&d_map_param, sizeof(MappingParameters));
+    cudaMemcpy(d_map_param, &map_param, sizeof(MappingParameters), cudaMemcpyHostToDevice);
 
     std::string index_file_path = argv[1];
     References references;
@@ -1931,6 +3104,24 @@ int main(int argc, char **argv) {
     double t0;
 
     t0 = GetTime();
+    GPUReferences *global_references;
+    cudaMallocManaged(&global_references, sizeof(GPUReferences));
+    global_references->num_refs = references.size();
+    cudaMalloc(&global_references->sequences.data, references.size() * sizeof(my_string));
+    global_references->sequences.length = references.size();
+    global_references->sequences.capacity = references.size();
+    for (int i = 0; i < references.size(); i++) {
+        my_string ref;
+        ref.slen = references.lengths[i];
+        cudaMalloc(&ref.data, references.lengths[i]);
+        cudaMemcpy(ref.data, references.sequences[i].data(), references.lengths[i], cudaMemcpyHostToDevice);
+        cudaMemcpy(global_references->sequences.data + i, &ref, sizeof(my_string), cudaMemcpyHostToDevice);
+    }
+    cudaMalloc(&global_references->lengths.data, references.size() * sizeof(int));
+    cudaMemcpy(global_references->lengths.data, references.lengths.data(), references.size() * sizeof(int), cudaMemcpyHostToDevice);
+    global_references->lengths.length = references.size();
+    global_references->lengths.capacity = references.size();
+
     RefRandstrobe *d_randstrobes;
     my_bucket_index_t *d_randstrobe_start_indices;
     std::cout << index.randstrobes.size() * sizeof(RefRandstrobe) << std::endl;
@@ -2114,7 +3305,7 @@ int main(int argc, char **argv) {
         //cudaDeviceSynchronize();
         //gpu_cost1 += GetTime() - t1;
 
-        threads_per_block = 32;
+        threads_per_block = 1;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (s_len * 2 + reads_per_block - 1) / reads_per_block;
         gpu_get_randstrobes<<<blocks_per_grid, threads_per_block>>>(s_len * 2, d_pre_sum, d_len, d_seq, d_pre_sum2, d_len2, d_seq2, d_index_para,
@@ -2132,7 +3323,7 @@ int main(int argc, char **argv) {
         //cudaDeviceSynchronize();
 
         double t11 = GetTime();
-        threads_per_block = 8;
+        threads_per_block = 1;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (s_len * 2 + reads_per_block - 1) / reads_per_block;
         gpu_get_hits_pre<<<blocks_per_grid, threads_per_block>>>(index.bits, index.filter_cutoff, para_rescue_cutoff, d_randstrobes, index.randstrobes.size(), d_randstrobe_start_indices,
@@ -2143,7 +3334,7 @@ int main(int argc, char **argv) {
 
       
         t11 = GetTime();
-        threads_per_block = 32;
+        threads_per_block = 1;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (s_len * 2 + reads_per_block - 1) / reads_per_block;
         gpu_get_hits_after<<<blocks_per_grid, threads_per_block>>>(index.bits, index.filter_cutoff, para_rescue_cutoff, d_randstrobes, index.randstrobes.size(), d_randstrobe_start_indices,
@@ -2156,7 +3347,7 @@ int main(int argc, char **argv) {
 
 
         t1 = GetTime();
-        threads_per_block = 32;
+        threads_per_block = 1;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (s_len * 2 + reads_per_block - 1) / reads_per_block;
         gpu_sort_hits<<<blocks_per_grid, threads_per_block>>>(s_len * 2, global_hits_per_ref0s, global_hits_per_ref1s);
@@ -2192,13 +3383,17 @@ int main(int argc, char **argv) {
 //        cpu_sort += GetTime() - t1;
 
         t1 = GetTime();
-        threads_per_block = 32;
+        threads_per_block = 1;
         reads_per_block = threads_per_block * GPU_thread_task_size;
 //        blocks_per_grid = (s_len * 4 + reads_per_block - 1) / reads_per_block;
 //        gpu_merge_hits_by_pre_sort<<<blocks_per_grid, threads_per_block>>>(s_len * 4, d_index_para, global_nams_info,
 //                                                                           global_hits_per_ref0s, global_hits_per_ref1s, global_sorted_ids);
-        blocks_per_grid = (s_len * 2 + reads_per_block - 1) / reads_per_block;
-        gpu_merge_hits<<<blocks_per_grid, threads_per_block>>>(s_len * 2, d_index_para, global_nams_info, global_hits_per_ref0s, global_hits_per_ref1s);
+        //blocks_per_grid = (s_len * 2 + reads_per_block - 1) / reads_per_block;
+        //gpu_merge_hits<<<blocks_per_grid, threads_per_block>>>(s_len * 2, d_index_para, global_nams_info, global_hits_per_ref0s, global_hits_per_ref1s);
+     
+        blocks_per_grid = (s_len + reads_per_block - 1) / reads_per_block;
+        gpu_merge_hits2<<<blocks_per_grid, threads_per_block>>>(s_len, d_index_para, global_nams_info, global_hits_per_ref0s, global_hits_per_ref1s,
+                                                               d_aligner, d_pre_sum, d_len, d_seq, d_pre_sum2, d_len2, d_seq2, global_references, d_map_param);
         cudaDeviceSynchronize();
         gpu_cost4 += GetTime() - t1;
 
@@ -2231,7 +3426,7 @@ int main(int argc, char **argv) {
         }
 
         t1 = GetTime();
-        threads_per_block = 32;
+        threads_per_block = 1;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (rescue_num + reads_per_block - 1) / reads_per_block;
         gpu_rescue_get_hits<<<blocks_per_grid, threads_per_block>>>(index.bits, index.filter_cutoff, para_rescue_cutoff, d_randstrobes, index.randstrobes.size(), d_randstrobe_start_indices,
@@ -2241,10 +3436,10 @@ int main(int argc, char **argv) {
         gpu_cost5 += GetTime() - t1;
 
         t1 = GetTime();
-        threads_per_block = 32;
+        threads_per_block = 1;
         reads_per_block = GPU_thread_task_size;
         blocks_per_grid = (rescue_num + reads_per_block - 1) / reads_per_block;
-//        gpu_rescue_sort_hits<<<rescue_num, threads_per_block>>>(rescue_num, d_index_para, global_hits_per_ref0s, global_hits_per_ref1s);
+        //gpu_rescue_sort_hits<<<rescue_num, threads_per_block>>>(rescue_num, d_index_para, global_hits_per_ref0s, global_hits_per_ref1s);
         gpu_sort_hits<<<blocks_per_grid, threads_per_block>>>(rescue_num, global_hits_per_ref0s, global_hits_per_ref1s);
         cudaDeviceSynchronize();
         gpu_cost6 += GetTime() - t1;
@@ -2252,7 +3447,7 @@ int main(int argc, char **argv) {
 
 
         t1 = GetTime();
-        threads_per_block = 32;
+        threads_per_block = 1;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (rescue_num + reads_per_block - 1) / reads_per_block;
         gpu_rescue_merge_hits<<<blocks_per_grid, threads_per_block>>>(rescue_num, d_index_para, global_nams_info, global_hits_per_ref0s, global_hits_per_ref1s);
