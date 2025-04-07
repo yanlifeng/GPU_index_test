@@ -209,6 +209,8 @@ struct my_vector {
     __device__ void release() {
         if (data != nullptr) my_free(data);
         data = nullptr;
+        length = 0;
+        capacity = 0;
     }
 
     __device__ T& operator[](int index) {
