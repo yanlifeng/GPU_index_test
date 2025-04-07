@@ -10,7 +10,7 @@ BASEFLAGS = -std=c++17 -arch=sm_86 -w -rdc=true $(INCLUDES)
 
 # Release/Debug flags
 RELEASE_FLAGS = -O2
-DEBUG_FLAGS   = -O2 -G
+DEBUG_FLAGS   = -O2 -G -g
 
 # Directories
 SRC_DIR = .
