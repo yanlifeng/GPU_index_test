@@ -779,7 +779,7 @@ __device__ void rescue_read_part(
     }
 }
 
-__device__ bool is_proper_nam_pair(const Nam nam1, const Nam nam2, float mu, float sigma) {
+__device__ inline bool is_proper_nam_pair(const Nam nam1, const Nam nam2, float mu, float sigma) {
     if (nam1.ref_id != nam2.ref_id || nam1.is_rc == nam2.is_rc) {
         return false;
     }
@@ -788,14 +788,14 @@ __device__ bool is_proper_nam_pair(const Nam nam1, const Nam nam2, float mu, flo
 
     // r1 ---> <---- r2
     bool r1_r2 = nam2.is_rc && (a <= b) && (b - a < mu + 10 * sigma);
-    if(r1_r2) return 1;
+//    if(r1_r2) return 1;
 
     // r2 ---> <---- r1
     bool r2_r1 = nam1.is_rc && (b <= a) && (a - b < mu + 10 * sigma);
-    if(r2_r1) return 1;
-    return 0;
+//    if(r2_r1) return 1;
+//    return 0;
 
-//    return r1_r2 || r2_r1;
+    return r1_r2 || r2_r1;
 }
 
 __device__ float top_dropoff(my_vector<Nam>& nams) {
@@ -880,7 +880,7 @@ __device__ my_vector<NamPair> get_best_scoring_nam_pairs(
         float mu,
         float sigma
 ) {
-    my_vector<NamPair> joint_nam_scores;
+    my_vector<NamPair> joint_nam_scores(nams1.size() + nams2.size());
     if (nams1.empty() && nams2.empty()) {
         return joint_nam_scores;
     }
@@ -997,7 +997,7 @@ __device__ my_vector<NamPair> get_best_scoring_nam_pairs(
         for (int j = 0; j < nams2.size(); j++) {
             Nam nam2 = nams2[j];
             int joint_hits = nam1.n_hits + nam2.n_hits;
-            if (joint_hits < best_joint_hits / 2) {
+            if (joint_hits < 0.5 * best_joint_hits) {
                 break;
             }
             if (is_proper_nam_pair(nam1, nam2, mu, sigma)) {
@@ -1109,6 +1109,23 @@ __device__ void align_PE_part(
     GPURead read2{seq2, rc2, seq_len2};
     double secondary_dropoff = 2 * aligner_parameters.mismatch + aligner_parameters.gap_open;
 
+    // check if nams is sorted by score
+    if (nams1.size() > 1) {
+        for (int i = 0; i < nams1.size() - 1; i++) {
+            if (nams1[i].score < nams1[i + 1].score) {
+                printf("nams1 not sorted by score\n");
+                assert(false);
+            }
+        }
+    }
+    if (nams2.size() > 1) {
+        for (int i = 0; i < nams2.size() - 1; i++) {
+            if (nams2[i].score < nams2[i + 1].score) {
+                printf("nams2 not sorted by score\n");
+                assert(false);
+            }
+        }
+    }
 
     if (nams1.empty() && nams2.empty()) {
         // None of the reads have any NAMs
@@ -1283,6 +1300,14 @@ __device__ void sort_hits_single(
     //bubble_sort(&(hits_per_ref[0]), hits_per_ref.size());
     quick_sort(&(hits_per_ref[0]), hits_per_ref.size());
 }
+
+__device__ void sort_nams_single(
+        my_vector<Nam>& nams
+) {
+    //bubble_sort(&(hits_per_ref[0]), hits_per_ref.size());
+    quick_sort(&(nams[0]), nams.size());
+}
+
 
 struct ref_ids_edge {
     int pre;
@@ -2396,6 +2421,21 @@ __global__ void gpu_get_randstrobes_and_hits(
     }
 }
 
+__global__ void gpu_sort_nams(
+        int num_tasks,
+        my_vector<Nam> *global_nams
+) {
+    int global_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int l_range = global_id * GPU_thread_task_size;
+    int r_range = l_range + GPU_thread_task_size;
+    if (r_range > num_tasks) r_range = num_tasks;
+    for (int id = l_range; id < r_range; id++) {
+        sort_nams_single(global_nams[id]);
+    }
+}
+
 __global__ void gpu_sort_hits(
         int num_tasks,
         my_vector<my_pair<int, Hit>>* hits_per_ref0s,
@@ -2738,6 +2778,7 @@ int main(int argc, char **argv) {
     double gpu_cost6 = 0;
     double gpu_cost7 = 0;
     double gpu_cost8 = 0;
+    double gpu_cost9 = 0;
     double tot_cost = 0;
 
     uint64_t check_sum = 0;
@@ -2957,13 +2998,21 @@ int main(int argc, char **argv) {
         }
 
         t1 = GetTime();
-        threads_per_block = 32;
+        threads_per_block = 1;
+        reads_per_block = threads_per_block * GPU_thread_task_size;
+        blocks_per_grid = (s_len * 2 + reads_per_block - 1) / reads_per_block;
+        gpu_sort_nams<<<blocks_per_grid, threads_per_block>>>(s_len * 2, global_nams);
+        cudaDeviceSynchronize();
+        gpu_cost8 += GetTime() - t1;
+
+        t1 = GetTime();
+        threads_per_block = 1;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (s_len + reads_per_block - 1) / reads_per_block;
         gpu_align_PE<<<blocks_per_grid, threads_per_block>>>(s_len, d_index_para, global_align_info, d_aligner, d_pre_sum, d_len, d_seq, d_pre_sum2, d_len2, d_seq2,
                                                              global_references, d_map_param, global_nams);
         cudaDeviceSynchronize();
-        gpu_cost8 += GetTime() - t1;
+        gpu_cost9 += GetTime() - t1;
 
         for (int i = 0; i < s_len * 2; ++i) {
             global_hits_num3 += global_hits_num[i];
@@ -2977,7 +3026,7 @@ int main(int argc, char **argv) {
     tot_cost += GetTime() - t0;
 
     std::cout << "gpu cost " << gpu_cost1 << " " << gpu_cost2 << " [" << gpu_cost2_1 << " " << gpu_cost2_2 << "] " << gpu_cost3 << " " << gpu_cost4 << std::endl;
-    std::cout << gpu_cost5 << " " << gpu_cost6 << " " << gpu_cost7 << " " << gpu_cost8 << std::endl;
+    std::cout << gpu_cost5 << " " << gpu_cost6 << " " << gpu_cost7 << " " << gpu_cost8 << " " << gpu_cost9 << std::endl;
     std::cout << "total cost " << tot_cost << std::endl;
     std::cout << "check_sum : " << check_sum << ", size_tot : " << size_tot << std::endl;
     std::cout << "total_hits12 : " << global_hits_num12 << ", nr_good_hits12 : " << global_nams_info12 << std::endl;
