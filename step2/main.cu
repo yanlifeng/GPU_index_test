@@ -656,49 +656,85 @@ __device__ static const uint8_t nt2int_mod8[8] = {
 __device__ bool has_shared_substring(const my_string& read_seq, const my_string& ref_seq, int k) {
     int sub_size = 2 * k / 3;
     int step_size = k / 3;
-//    //my_vector<uint32_t> hash0;
-//    __shared__ uint32_t hash0[50];
-//    int N = 0;
-//    for (int i = 0; i + sub_size < read_seq.size(); i += step_size) {
-//        uint32_t h = 0;
-//        for (int j = 0; j < sub_size; ++j) {
-//            unsigned char base = read_seq[i + j];
-//            uint8_t code = nt2int_mod8[base % 8];
-//            h = (h << 2) | code;
-//        }
-//        hash0[N++] = h;
-//        assert(N <= 50);
-//        //hash0.push_back(h);
-//    }
-//    quick_sort(&(hash0[0]), N);
-//    for (int i = 0; i + sub_size < ref_seq.size(); i++) {
-//        uint32_t h = 0;
-//        for (int j = 0; j < sub_size; ++j) {
-//            unsigned char base = ref_seq[i + j];
-//            uint8_t code = nt2int_mod8[base % 8];
-//            h = (h << 2) | code;
-//        }
-//        int left = 0, right = N - 1;
-//        while (left <= right) {
-//            int mid = (left + right) / 2;
-//            if (hash0[mid] == h) return true;
-//            else if (hash0[mid] < h) left = mid + 1;
-//            else right = mid - 1;
-//        }
-//        //for (int j = 0; j < N; j++) {
-//        //    if (h == hash0[j]) return true;
-//        //}
-//    }
-//    return false;
-
-    my_string submer;
-    for (size_t i = 0; i + sub_size < read_seq.size(); i += step_size) {
-        submer = read_seq.substr(i, sub_size);
-        if (ref_seq.find(submer) != -1) {
-            return true;
+    //my_vector<uint32_t> hash0;
+    __shared__ uint32_t g_hash0[50 * 32];
+    uint32_t *hash0 = &(g_hash0[threadIdx.x * 50]);
+    int N = 0;
+    for (int i = 0; i + sub_size < read_seq.size(); i += step_size) {
+        uint32_t h = 0;
+        for (int j = 0; j < sub_size; ++j) {
+            unsigned char base = read_seq[i + j];
+            //assert(base != 'N' && base != 'n');
+            uint8_t code = nt2int_mod8[base % 8];
+            h = (h << 2) | code;
         }
+        hash0[N++] = h;
+        assert(N <= 50);
+        //hash0.push_back(h);
+    }
+    quick_sort(&(hash0[0]), N);
+    //bool find_tag = false;
+    //int a_find_pos1 = 0;
+    //int a_find_pos2 = 0;
+    for (int i = 0; i + sub_size < ref_seq.size(); i++) {
+        uint32_t h = 0;
+        for (int j = 0; j < sub_size; ++j) {
+            unsigned char base = ref_seq[i + j];
+            uint8_t code = nt2int_mod8[base % 8];
+            h = (h << 2) | code;
+        }
+        int left = 0, right = N - 1;
+        while (left <= right) {
+            int mid = (left + right) / 2;
+            if (hash0[mid] == h) return true;
+            else if (hash0[mid] < h) left = mid + 1;
+            else right = mid - 1;
+        }
+        //for (int j = 0; j < N; j++) {
+        //    //if (h == hash0[j]) return true;
+        //    if (h == hash0[j]) {
+        //        find_tag = true;
+        //        a_find_pos1 = j * step_size;
+        //        a_find_pos2 = i;
+        //        break;
+        //    }
+        //}
+        //if (find_tag) break;
     }
     return false;
+
+    //bool find_tag2 = false;
+    //int b_find_pos1 = 0;
+    //int b_find_pos2 = 0;
+    //my_string submer;
+    //for (size_t i = 0; i + sub_size < read_seq.size(); i += step_size) {
+    //    submer = read_seq.substr(i, sub_size);
+    //    int res = ref_seq.find(submer);
+    //    if (res != -1) {
+    //        //return true;
+    //        find_tag2 = true;
+    //        b_find_pos1 = i;
+    //        b_find_pos2 = res;
+    //        break;
+    //    }
+    //}
+    //if (find_tag != find_tag2) {
+    //    acquire_lock();
+    //    printf("%d != %d --- sub_size %d -- [%d %d] [%d %d]\n", find_tag, find_tag2, sub_size, a_find_pos1, a_find_pos2, b_find_pos1, b_find_pos2);
+
+    //    printf("read seq:\n");
+    //    for (int i = 0; i < read_seq.length(); i++) printf("%c", read_seq[i]);
+    //    printf("\n");
+
+    //    printf("ref seq:\n");
+    //    for (int i = 0; i < ref_seq.length(); i++) printf("%c", ref_seq[i]);
+    //    printf("\n");
+    //    
+    //    release_lock();
+    //    
+    //}
+    ////return false;
+    //return find_tag;
 }
 
 __device__ bool rescue_mate_part(
@@ -4035,7 +4071,7 @@ int main(int argc, char **argv) {
         int reads_per_block;
         int blocks_per_grid;
 
-        threads_per_block = 1;
+        threads_per_block = 32;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (s_len * 2 + reads_per_block - 1) / reads_per_block;
         gpu_get_randstrobes<<<blocks_per_grid, threads_per_block>>>(s_len * 2, d_pre_sum, d_len, d_seq, d_pre_sum2, d_len2, d_seq2, d_index_para,
@@ -4059,7 +4095,7 @@ int main(int argc, char **argv) {
 
       
         t11 = GetTime();
-        threads_per_block = 1;
+        threads_per_block = 32;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (s_len * 2 + reads_per_block - 1) / reads_per_block;
         gpu_get_hits_after<<<blocks_per_grid, threads_per_block>>>(index.bits, index.filter_cutoff, para_rescue_cutoff, d_randstrobes, index.randstrobes.size(), d_randstrobe_start_indices,
@@ -4086,7 +4122,7 @@ int main(int argc, char **argv) {
         printf("normal read num %d\n", todo_cnt);
 
         t1 = GetTime();
-        threads_per_block = 1;
+        threads_per_block = 32;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (todo_cnt + reads_per_block - 1) / reads_per_block;
         gpu_sort_hits<<<blocks_per_grid, threads_per_block>>>(todo_cnt, global_hits_per_ref0s, global_hits_per_ref1s, global_todo_ids);
@@ -4095,7 +4131,7 @@ int main(int argc, char **argv) {
         printf("sort hits done\n");
 
         t1 = GetTime();
-        threads_per_block = 1;
+        threads_per_block = 32;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (todo_cnt + reads_per_block - 1) / reads_per_block;
         gpu_merge_hits_get_nams<<<blocks_per_grid, threads_per_block>>>(todo_cnt, d_index_para, global_nams_info,
@@ -4135,7 +4171,7 @@ int main(int argc, char **argv) {
         }
 
         t1 = GetTime();
-        threads_per_block = 1;
+        threads_per_block = 32;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (todo_cnt + reads_per_block - 1) / reads_per_block;
         gpu_rescue_get_hits<<<blocks_per_grid, threads_per_block>>>(index.bits, index.filter_cutoff, para_rescue_cutoff, d_randstrobes, index.randstrobes.size(), d_randstrobe_start_indices,
@@ -4146,7 +4182,7 @@ int main(int argc, char **argv) {
         printf("rescue get hits done\n");
 
         t1 = GetTime();
-        threads_per_block = 1;
+        threads_per_block = 32;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (todo_cnt + reads_per_block - 1) / reads_per_block;
         gpu_rescue_sort_hits<<<blocks_per_grid, threads_per_block>>>(todo_cnt, global_hits_per_ref0s, global_hits_per_ref1s, global_todo_ids);
@@ -4156,7 +4192,7 @@ int main(int argc, char **argv) {
 
 
         t1 = GetTime();
-        threads_per_block = 1;
+        threads_per_block = 32;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (todo_cnt + reads_per_block - 1) / reads_per_block;
         gpu_rescue_merge_hits_get_nams<<<blocks_per_grid, threads_per_block>>>(todo_cnt, d_index_para, global_nams_info,
@@ -4170,7 +4206,7 @@ int main(int argc, char **argv) {
         }
 
         t1 = GetTime();
-        threads_per_block = 1;
+        threads_per_block = 32;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (s_len * 2 + reads_per_block - 1) / reads_per_block;
         gpu_sort_nams<<<blocks_per_grid, threads_per_block>>>(s_len * 2, global_nams, d_map_param);
@@ -4213,7 +4249,7 @@ int main(int argc, char **argv) {
 		//}
 
         t1 = GetTime();
-        threads_per_block = 1;
+        threads_per_block = 32;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (s_len + reads_per_block - 1) / reads_per_block;
         gpu_pre_cal_type<<<blocks_per_grid, threads_per_block>>>(s_len, map_param.dropoff_threshold, global_nams, global_todo_ids);
@@ -4229,18 +4265,11 @@ int main(int argc, char **argv) {
 
         t1 = GetTime();
 
-//        threads_per_block = 1;
-//        reads_per_block = threads_per_block * GPU_thread_task_size;
-//        blocks_per_grid = (s_len + reads_per_block - 1) / reads_per_block;
-//        gpu_align_PE<<<blocks_per_grid, threads_per_block>>>(s_len, d_index_para, global_align_info, d_aligner, d_pre_sum, d_len, d_seq, d_pre_sum2, d_len2, d_seq2,
-//                                                             global_references, d_map_param, global_nams, global_todo_ids);
-//        cudaDeviceSynchronize();
-
         t11 = GetTime();
         for (int i = 0; i < types[0].size(); i++) {
             global_todo_ids[i] = types[0][i];
         }
-        threads_per_block = 1;
+        threads_per_block = 32;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (types[0].size() + reads_per_block - 1) / reads_per_block;
         gpu_align_PE0<<<blocks_per_grid, threads_per_block>>>(types[0].size(), s_len, d_index_para, global_align_info, d_aligner, d_pre_sum, d_len, d_seq, d_pre_sum2, d_len2, d_seq2,
@@ -4252,7 +4281,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < types[1].size(); i++) {
             global_todo_ids[i] = types[1][i];
         }
-        threads_per_block = 1;
+        threads_per_block = 32;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (types[1].size() + reads_per_block - 1) / reads_per_block;
         gpu_align_PE1<<<blocks_per_grid, threads_per_block>>>(types[1].size(), s_len, d_index_para, global_align_info, d_aligner, d_pre_sum, d_len, d_seq, d_pre_sum2, d_len2, d_seq2,
@@ -4264,7 +4293,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < types[2].size(); i++) {
             global_todo_ids[i] = types[2][i];
         }
-        threads_per_block = 1;
+        threads_per_block = 32;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (types[2].size() + reads_per_block - 1) / reads_per_block;
         gpu_align_PE2<<<blocks_per_grid, threads_per_block>>>(types[2].size(), s_len, d_index_para, global_align_info, d_aligner, d_pre_sum, d_len, d_seq, d_pre_sum2, d_len2, d_seq2,
@@ -4276,7 +4305,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < types[3].size(); i++) {
             global_todo_ids[i] = types[3][i];
         }
-        threads_per_block = 1;
+        threads_per_block = 32;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (types[3].size() + reads_per_block - 1) / reads_per_block;
         gpu_align_PE3<<<blocks_per_grid, threads_per_block>>>(types[3].size(), s_len, d_index_para, global_align_info, d_aligner, d_pre_sum, d_len, d_seq, d_pre_sum2, d_len2, d_seq2,
@@ -4291,7 +4320,7 @@ int main(int argc, char **argv) {
             int id2 = types[4][i] + s_len;
             nams_id.push_back(std::make_pair(global_nams[id1].length + global_nams[id2].length, types[4][i]));
         }
-        //std::sort(nams_id.begin(), nams_id.end());
+        std::sort(nams_id.begin(), nams_id.end());
         for (int i = 0; i < types[4].size(); i++) {
             global_todo_ids[i] = nams_id[i].second;
         }
@@ -4309,10 +4338,10 @@ int main(int argc, char **argv) {
 
 
         
-		print_global_align_res(global_align_res, s_len);
+		//print_global_align_res(global_align_res, s_len);
 
 
-        threads_per_block = 1;
+        threads_per_block = 32;
         reads_per_block = threads_per_block * GPU_thread_task_size;
         blocks_per_grid = (s_len + reads_per_block - 1) / reads_per_block;
         gpu_free_align_res<<<blocks_per_grid, threads_per_block>>>(s_len, global_align_res);
