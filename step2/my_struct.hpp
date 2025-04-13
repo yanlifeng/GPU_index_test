@@ -41,6 +41,8 @@ struct Nam {
         if(query_start != nn.query_start) return query_start < nn.query_start;
         if(ref_end != nn.ref_end) return ref_end < nn.ref_end;
         if(ref_start != nn.ref_start) return ref_start < nn.ref_start;
+        if(ref_id != nn.ref_id) return ref_id < nn.ref_id;
+        return is_rc < nn.is_rc;
     }
 };
 
