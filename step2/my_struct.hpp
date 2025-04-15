@@ -7,19 +7,19 @@
 
 // Non-overlapping approximate match
 struct Nam {
-    int nam_id;
-    int query_start;
-    int query_end;
-    int query_prev_hit_startpos;
-    int ref_start;
-    int ref_end;
-    int ref_prev_hit_startpos;
-    int n_hits = 0;
-    int ref_id;
-    float score;
+    int nam_id{0};
+    int query_start{0};
+    int query_end{0};
+    int query_prev_hit_startpos{0};
+    int ref_start{0};
+    int ref_end{0};
+    int ref_prev_hit_startpos{0};
+    int n_hits{0};
+    int ref_id{0};
+    float score{0};
 //    unsigned int previous_query_start;
 //    unsigned int previous_ref_start;
-    bool is_rc = false;
+    bool is_rc{false};
 
     __host__ __device__ int ref_span() const {
         return ref_end - ref_start;
@@ -36,12 +36,13 @@ struct Nam {
 //    }
 
     __host__ __device__ bool operator < (const Nam& nn) const {
-        if(score != nn.score) return score > nn.score;
+        if(ref_id != nn.ref_id) return ref_id < nn.ref_id;
+        //if(score != nn.score) return score > nn.score;
+        if(n_hits != nn.n_hits) return n_hits > nn.n_hits;
         if(query_end != nn.query_end) return query_end < nn.query_end;
         if(query_start != nn.query_start) return query_start < nn.query_start;
         if(ref_end != nn.ref_end) return ref_end < nn.ref_end;
         if(ref_start != nn.ref_start) return ref_start < nn.ref_start;
-        if(ref_id != nn.ref_id) return ref_id < nn.ref_id;
         return is_rc < nn.is_rc;
     }
 };
