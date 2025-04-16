@@ -599,7 +599,8 @@ __device__ bool extend_seed_part(
     if (projected_ref_end - projected_ref_start == query.size() && consistent_nam) {
         my_string ref_segm_ham = ref.substr(projected_ref_start, query.size());
         int hamming_dist = 0;
-        for (size_t i = 0; i < query.size(); ++i) {
+        int limit_error = query.size() * 0.05;
+        for (size_t i = 0; i < query.size() && hamming_dist <= limit_error; ++i) {
             if (query[i] != ref_segm_ham[i]) {
                 ++hamming_dist;
             }
@@ -668,8 +669,9 @@ __device__ bool has_shared_substring(const my_string& read_seq, const my_string&
             h = (h << 2) | code;
         }
         hash0[N++] = h;
-        assert(N <= 50);
+        //assert(N <= 50);
         //hash0.push_back(h);
+        //N++;
     }
     quick_sort(&(hash0[0]), N);
     for (int i = 0; i + sub_size < ref_seq.size(); i++) {
@@ -1228,7 +1230,7 @@ __device__ void get_best_scoring_nam_pairs_sort2(
     pos2 = mid_pos2;
     nams1_len = mid_pos1;
     nams2_len = nams2.size();
-    for (int ref_id = 0; ref_id < 3000; ref_id++) {
+    for (int ref_id = 0; ref_id < 30; ref_id++) {
     //for (int gid = 0; gid < result.size(); gid++) {
         //int ref_id = result[gid];
         while (pos1 < nams1_len && nams1[pos1].ref_id < ref_id) pos1++; 
@@ -1243,10 +1245,10 @@ __device__ void get_best_scoring_nam_pairs_sort2(
             for (int j = pos2; j < end2; j++) {
                 const Nam &nam2 = nams2[j];
                 int joint_hits = nam1.n_hits + nam2.n_hits;
-                if (joint_hits < best_joint_hits / 2 || round_size > max_tries) {
-                //if (joint_hits < best_joint_hits / 2) {
-                    break;
-                }
+                //if (joint_hits < best_joint_hits / 2 || round_size > max_tries) {
+                ////if (joint_hits < best_joint_hits / 2) {
+                //    break;
+                //}
                 //assert(nam1.ref_id == ref_id && nam1.ref_id == nam2.ref_id && nam1.is_rc == 0 && nam2.is_rc == 1);
                 if (is_proper_nam_pair3(nam1, nam2, mu, sigma)) {
                     joint_nam_scores.push_back(NamPair{joint_hits, &nams1, &nams2, i, j});
@@ -1256,7 +1258,7 @@ __device__ void get_best_scoring_nam_pairs_sort2(
                     round_size++;
                 }
             }
-            if (round_size > max_tries) break;
+            //if (round_size > max_tries) break;
         }
     }
 
@@ -1297,7 +1299,7 @@ __device__ void get_best_scoring_nam_pairs_sort2(
     pos2 = 0;
     nams1_len = nams1.size();
     nams2_len = mid_pos2;
-    for (int ref_id = 0; ref_id < 3000; ref_id++) {
+    for (int ref_id = 0; ref_id < 30; ref_id++) {
     //for (int gid = 0; gid < result.size(); gid++) {
         //int ref_id = result[gid];
         while (pos1 < nams1_len && nams1[pos1].ref_id < ref_id) pos1++; 
@@ -1312,10 +1314,10 @@ __device__ void get_best_scoring_nam_pairs_sort2(
             for (int j = pos2; j < end2; j++) {
                 const Nam &nam2 = nams2[j];
                 int joint_hits = nam1.n_hits + nam2.n_hits;
-                if (joint_hits < best_joint_hits / 2 || round_size > max_tries) {
-                //if (joint_hits < best_joint_hits / 2) {
-                    break;
-                }
+                //if (joint_hits < best_joint_hits / 2 || round_size > max_tries) {
+                ////if (joint_hits < best_joint_hits / 2) {
+                //    break;
+                //}
                 //assert(nam1.ref_id == ref_id && nam1.ref_id == nam2.ref_id && nam1.is_rc == 1 && nam2.is_rc == 0);
                 if (is_proper_nam_pair3(nam1, nam2, mu, sigma)) {
                     joint_nam_scores.push_back(NamPair{joint_hits, &nams1, &nams2, i, j});
@@ -1325,7 +1327,7 @@ __device__ void get_best_scoring_nam_pairs_sort2(
                     round_size++;
                 }
             }
-            if (round_size > max_tries) break;
+            //if (round_size > max_tries) break;
         }
     }
 
@@ -1419,6 +1421,296 @@ __device__ void get_best_scoring_nam_pairs_sort2(
             return nam1_2.ref_start < nam2_2.ref_start;
 
     });
+
+    return;
+}
+
+#define TOP_K 40
+
+__device__ void heapify_down(NamPair heap[], int size, int i) {
+    while (2 * i + 1 < size) {
+        int smallest = i;
+        int l = 2 * i + 1;
+        int r = 2 * i + 2;
+
+        if (l < size && heap[l].score < heap[smallest].score)
+            smallest = l;
+        if (r < size && heap[r].score < heap[smallest].score)
+            smallest = r;
+
+        if (smallest == i) break;
+
+        NamPair tmp = heap[i];
+        heap[i] = heap[smallest];
+        heap[smallest] = tmp;
+
+        i = smallest;
+    }
+}
+
+__device__ void heapify_up(NamPair heap[], int i) {
+    while (i > 0) {
+        int parent = (i - 1) / 2;
+        if (heap[parent].score <= heap[i].score) break;
+
+        NamPair tmp = heap[i];
+        heap[i] = heap[parent];
+        heap[parent] = tmp;
+
+        i = parent;
+    }
+}
+
+__device__ void maintain_top_k(NamPair heap[], int *heap_size, NamPair new_pair) {
+    if (*heap_size < TOP_K) {
+        heap[*heap_size] = new_pair;
+        heapify_up(heap, *heap_size);
+        (*heap_size)++;
+    } else if (new_pair.score > heap[0].score) {
+        heap[0] = new_pair;
+        heapify_down(heap, *heap_size, 0);
+    }
+}
+
+__device__ void get_best_scoring_nam_pairs_sort3(
+        my_vector<NamPair>& joint_nam_scores,
+        my_vector<Nam>& nams1,
+        my_vector<Nam>& nams2,
+        float mu_f,
+        float sigma_f,
+        int max_tries,
+        int tid
+) {
+    int mu = (int)mu_f;
+    int sigma = (int)sigma_f;
+    int nams1_len = nams1.size();
+    int nams2_len = nams2.size();
+    my_vector<bool> added_n1(nams1_len);
+    my_vector<bool> added_n2(nams2_len);
+    for(int i = 0; i < nams1_len; i++) added_n1.push_back(false);
+    for(int i = 0; i < nams2_len; i++) added_n2.push_back(false);
+
+    // find is_rc split pos
+    int mid_pos1 = nams1.size();
+    for (int i = 0; i < nams1.size(); i++) {
+        if (nams1[i].is_rc == 1) {
+            mid_pos1 = i;
+            break;
+        }
+    }
+    int mid_pos2 = nams2.size();
+    for (int i = 0; i < nams2.size(); i++) {
+        if (nams2[i].is_rc == 1) {
+            mid_pos2 = i;
+            break;
+        }
+    }
+
+	NamPair heap[TOP_K];
+    int heap_size = 0;
+
+
+    int pre_ref_id, p1, p2, pos1, pos2, best_nam2_n_hits;
+
+    int best_joint_hits = 0;
+    pos1 = 0;
+    pos2 = mid_pos2;
+    nams1_len = mid_pos1;
+    nams2_len = nams2.size();
+    for (int ref_id = 0; ref_id < 3000; ref_id++) {
+        while (pos1 < nams1_len && nams1[pos1].ref_id < ref_id) pos1++; 
+        while (pos2 < nams2_len && nams2[pos2].ref_id < ref_id) pos2++; 
+        int end1 = pos1, end2 = pos2;
+        while (end1 < nams1_len && nams1[end1].ref_id == ref_id) end1++;
+        while (end2 < nams2_len && nams2[end2].ref_id == ref_id) end2++;
+        if (pos1 == nams1_len || pos2 == nams2_len) break;
+        best_nam2_n_hits = -1;
+        for (int i = pos2; i < end2; i++) best_nam2_n_hits = my_max(best_nam2_n_hits, nams2[i].n_hits);
+        int round_size = 0;
+        for (int i = pos1 + 1; i < end1; i++) {
+            assert(nams1[i].n_hits <= nams1[i - 1].n_hits);
+        }
+        for (int i = pos1; i < end1; i++) {
+            const Nam &nam1 = nams1[i];
+            int round_best_score = nam1.n_hits + best_nam2_n_hits;
+            if (round_best_score < best_joint_hits / 2) break;
+            if (heap_size == TOP_K && round_best_score < heap[0].score) break;
+            int val1 = my_max(0, nam1.ref_start - nam1.query_start);
+            int l_pos = pos2, r_pos = end2 - 1, ans_pos = end2;
+            while (l_pos <= r_pos) {
+                int mid_pos = (l_pos + r_pos) / 2;
+                int val2 = my_max(0, nams2[mid_pos].ref_start - nams2[mid_pos].query_start);
+                if (val2 >= val1) {
+                    ans_pos = mid_pos;
+                    r_pos = mid_pos - 1;
+                } else {
+                    l_pos = mid_pos + 1;
+                }
+            }
+            for (int j = ans_pos; j < end2; j++) {
+                const Nam &nam2 = nams2[j];
+                int val2 = my_max(0, nams2[j].ref_start - nams2[j].query_start);
+                //assert(nam1.ref_id == ref_id && nam1.ref_id == nam2.ref_id && nam1.is_rc == 0 && nam2.is_rc == 1 && val2 >= val1);
+                if (val2 >= val1 + mu + 10 * sigma) break;
+                int joint_hits = nam1.n_hits + nam2.n_hits;
+                if (joint_hits < best_joint_hits / 2) continue;
+                //bool res = is_proper_nam_pair(nam1, nam2, mu, sigma);
+                //if (res == false) continue;
+                //joint_nam_scores.push_back(NamPair{joint_hits, &nams1, &nams2, i, j});
+				maintain_top_k(heap, &heap_size, NamPair{joint_hits, &nams1, &nams2, i, j});
+                added_n1[i] = 1;
+                added_n2[j] = 1;
+                best_joint_hits = my_max(joint_hits, best_joint_hits);
+                round_size++;
+            }
+        }
+    }
+
+    pos1 = mid_pos1;
+    pos2 = 0;
+    nams1_len = nams1.size();
+    nams2_len = mid_pos2;
+    for (int ref_id = 0; ref_id < 3000; ref_id++) {
+        while (pos1 < nams1_len && nams1[pos1].ref_id < ref_id) pos1++; 
+        while (pos2 < nams2_len && nams2[pos2].ref_id < ref_id) pos2++; 
+        int end1 = pos1, end2 = pos2;
+        while (end1 < nams1_len && nams1[end1].ref_id == ref_id) end1++;
+        while (end2 < nams2_len && nams2[end2].ref_id == ref_id) end2++;
+        if (pos1 == nams1_len || pos2 == nams2_len) break;
+        best_nam2_n_hits = -1;
+        for (int i = pos2; i < end2; i++) best_nam2_n_hits = my_max(best_nam2_n_hits, nams2[i].n_hits);
+        int round_size = 0;
+        for (int i = pos1 + 1; i < end1; i++) {
+            assert(nams1[i].n_hits <= nams1[i - 1].n_hits);
+        }
+        for (int i = pos1; i < end1; i++) {
+            const Nam &nam1 = nams1[i];
+            int round_best_score = nam1.n_hits + best_nam2_n_hits;
+            if (round_best_score < best_joint_hits / 2) break;
+            if (heap_size == TOP_K && round_best_score < heap[0].score) break;
+            int val1 = my_max(0, nam1.ref_start - nam1.query_start);
+            int l_pos = pos2, r_pos = end2 - 1, ans_pos = end2;
+            while (l_pos <= r_pos) {
+                int mid_pos = (l_pos + r_pos) / 2;
+                int val2 = my_max(0, nams2[mid_pos].ref_start - nams2[mid_pos].query_start);
+                if (val2 > val1 - (mu + 10 * sigma)) {
+                    ans_pos = mid_pos;
+                    r_pos = mid_pos - 1;
+                } else {
+                    l_pos = mid_pos + 1;
+                }
+            }
+            for (int j = ans_pos; j < end2; j++) {
+                const Nam &nam2 = nams2[j];
+                int val2 = my_max(0, nams2[j].ref_start - nams2[j].query_start);
+                //assert(nam1.ref_id == ref_id && nam1.ref_id == nam2.ref_id && nam1.is_rc == 1 && nam2.is_rc == 0 && val2 > val1 - (mu + 10 * sigma));
+                if (val2 > val1) break;
+                int joint_hits = nam1.n_hits + nam2.n_hits;
+                if (joint_hits < best_joint_hits / 2) continue;
+                //bool res = is_proper_nam_pair(nam1, nam2, mu, sigma);
+                //if (res == false) continue;
+                //joint_nam_scores.push_back(NamPair{joint_hits, &nams1, &nams2, i, j});
+				maintain_top_k(heap, &heap_size, NamPair{joint_hits, &nams1, &nams2, i, j});
+                added_n1[i] = 1;
+                added_n2[j] = 1;
+                best_joint_hits = my_max(joint_hits, best_joint_hits);
+                round_size++;
+            }
+        }
+    }
+
+    // Find high-scoring R1 NAMs that are not part of a proper pair
+    int best_joint_hits1 = best_joint_hits;
+    if (best_joint_hits1 == 0) {
+        for (int i = 0; i < nams1.size(); i++) {
+            best_joint_hits1 = my_max(best_joint_hits1, nams1[i].n_hits);
+        }
+    }
+    int now_cnt = 0;
+    pre_ref_id = nams1[0].ref_id + 3000 * nams1[0].is_rc;
+    for(int i = 0; i < nams1.size(); i++) {
+    //for(int i = 0; i < my_min(nams1.size(), max_tries); i++) {
+        int ref_id = nams1[i].ref_id + 3000 * nams1[i].is_rc;
+        if (ref_id == pre_ref_id) now_cnt++;
+        else {
+            now_cnt = 1;
+            pre_ref_id = ref_id;
+        }
+        if (now_cnt > max_tries) continue;
+        Nam nam1 = nams1[i];
+        if (nam1.n_hits < best_joint_hits1 / 2) {
+            //break;
+            continue;
+        }
+        if (added_n1[i]) {
+            continue;
+        }
+        joint_nam_scores.push_back(NamPair{nam1.n_hits, &nams1, &nams2, i, -1});
+        //maintain_top_k(heap, &heap_size, NamPair{nam1.n_hits, &nams1, &nams2, i, -1});
+    }
+
+    // Find high-scoring R2 NAMs that are not part of a proper pair
+    int best_joint_hits2 = best_joint_hits;
+    if (best_joint_hits2 == 0) {
+        for (int i = 0; i < nams2.size(); i++) {
+            best_joint_hits2 = my_max(best_joint_hits2, nams2[i].n_hits);
+        }
+    }
+    for(int i = 0; i < nams2.size(); i++) {
+    //for(int i = 0; i < my_min(nams2.size(), max_tries); i++) {
+        Nam nam2 = nams2[i];
+        if (nam2.n_hits < best_joint_hits2 / 2) {
+            continue;
+        }
+        if (added_n2[i]) {
+            continue;
+        }
+        //joint_nam_scores.push_back(NamPair{nam2.n_hits, &nams1, &nams2, -1, i});
+        maintain_top_k(heap, &heap_size, NamPair{nam2.n_hits, &nams1, &nams2, -1, i});
+    }
+
+    for (int i = 0; i < heap_size; i++) joint_nam_scores.push_back(heap[i]);
+
+    quick_sort_iterative(&(joint_nam_scores[0]), 0, joint_nam_scores.size() - 1, [](const NamPair &n1, const NamPair &n2) {
+            //if (n1.score != n2.score) return n1.score > n2.score;
+            //if (n1.nam1.score != n2.nam1.score) return n1.nam1.score > n2.nam1.score;
+            //if (n1.nam1.is_rc != n2.nam1.is_rc) return !n1.nam1.is_rc;  // false < true
+            //if (n1.nam1.query_end != n2.nam1.query_end) return n1.nam1.query_end < n2.nam1.query_end;
+            //if (n1.nam1.query_start != n2.nam1.query_start) return n1.nam1.query_start < n2.nam1.query_start;
+            //if (n1.nam1.ref_end != n2.nam1.ref_end) return n1.nam1.ref_end < n2.nam1.ref_end;
+            //if (n1.nam1.ref_start != n2.nam1.ref_start) return n1.nam1.ref_start < n2.nam1.ref_start;
+            //if (n1.nam2.score != n2.nam2.score) return n1.nam2.score > n2.nam2.score;
+            //if (n1.nam2.is_rc != n2.nam2.is_rc) return !n1.nam2.is_rc;
+            //if (n1.nam2.query_end != n2.nam2.query_end) return n1.nam2.query_end < n2.nam2.query_end;
+            //if (n1.nam2.query_start != n2.nam2.query_start) return n1.nam2.query_start < n2.nam2.query_start;
+            //if (n1.nam2.ref_end != n2.nam2.ref_end) return n1.nam2.ref_end < n2.nam2.ref_end;
+            //return n1.nam2.ref_start < n2.nam2.ref_start;
+
+            //return n1.score > n2.score;
+
+            Nam dummy_nam;
+            dummy_nam.ref_start = -1;
+            Nam nam1_1 = n1.i1 == -1 ? dummy_nam : (*n1.nams1)[n1.i1];
+            Nam nam1_2 = n1.i2 == -1 ? dummy_nam : (*n1.nams2)[n1.i2];
+            Nam nam2_1 = n2.i1 == -1 ? dummy_nam : (*n2.nams1)[n2.i1];
+            Nam nam2_2 = n2.i2 == -1 ? dummy_nam : (*n2.nams2)[n2.i2];
+
+            if (n1.score != n2.score) return n1.score > n2.score;
+            if (nam1_1.score != nam2_1.score) return nam1_1.score > nam2_1.score;
+            if (nam1_1.is_rc != nam2_1.is_rc) return !nam1_1.is_rc;  // false < true
+            if (nam1_1.query_end != nam2_1.query_end) return nam1_1.query_end < nam2_1.query_end;
+            if (nam1_1.query_start != nam2_1.query_start) return nam1_1.query_start < nam2_1.query_start;
+            if (nam1_1.ref_end != nam2_1.ref_end) return nam1_1.ref_end < nam2_1.ref_end;
+            if (nam1_1.ref_start != nam2_1.ref_start) return nam1_1.ref_start < nam2_1.ref_start;
+            if (nam1_2.score != nam2_2.score) return nam1_2.score > nam2_2.score;
+            if (nam1_2.is_rc != nam2_2.is_rc) return !nam1_2.is_rc;
+            if (nam1_2.query_end != nam2_2.query_end) return nam1_2.query_end < nam2_2.query_end;
+            if (nam1_2.query_start != nam2_2.query_start) return nam1_2.query_start < nam2_2.query_start;
+            if (nam1_2.ref_end != nam2_2.ref_end) return nam1_2.ref_end < nam2_2.ref_end;
+            return nam1_2.ref_start < nam2_2.ref_start;
+
+    });
+    
 
     return;
 }
@@ -1765,13 +2057,13 @@ __device__ void align_PE_part4(
 
     my_vector<NamPair> joint_nam_scores(nams1.size() + nams2.size());
     //get_best_scoring_nam_pairs(joint_nam_scores, nams1, nams2, mu, sigma, max_tries, tid);
-    get_best_scoring_nam_pairs_sort2(joint_nam_scores, nams1, nams2, mu, sigma, max_tries, tid);
+    get_best_scoring_nam_pairs_sort3(joint_nam_scores, nams1, nams2, mu, sigma, max_tries, tid);
     align_tmp_res.type = 4;
 
     if (joint_nam_scores.size() > max_tries) joint_nam_scores.length = max_tries;
-    //int nams1_len = my_min(nams1.size(), max_tries * 2);
+    //int nams1_len = my_min(nams1.size(), max_tries);
     int nams1_len = nams1.size();
-    //int nams2_len = my_min(nams2.size(), max_tries * 2);
+    //int nams2_len = my_min(nams2.size(), max_tries);
     int nams2_len = nams2.size();
     my_vector<bool> is_aligned1(nams1_len + 1);
     my_vector<bool> is_aligned2(nams2_len + 1);
@@ -1780,7 +2072,7 @@ __device__ void align_PE_part4(
 
     {
         int id = 0;
-        for (int i = 0; i < nams1.size(); i++) {
+        for (int i = 0; i < nams1_len; i++) {
             if (nams1[i].score > nams1[id].score) id = i;
         }
         Nam n1_max = nams1[id];
@@ -1791,7 +2083,7 @@ __device__ void align_PE_part4(
         is_aligned1[id] = 1;
 
         id = 0;
-        for (int i = 0; i < nams2.size(); i++) {
+        for (int i = 0; i < nams2_len; i++) {
             if (nams2[i].score > nams2[id].score) id = i;
         }
         Nam n2_max = nams2[id];
@@ -1817,6 +2109,8 @@ __device__ void align_PE_part4(
         int id2 = joint_nam_scores[i].i2 == -1 ? nams2_len : joint_nam_scores[i].i2;
         Nam n1 = joint_nam_scores[i].i1 == -1 ? dummy_nam : nams1[joint_nam_scores[i].i1];
         Nam n2 = joint_nam_scores[i].i2 == -1 ? dummy_nam : nams2[joint_nam_scores[i].i2];
+        id1 = my_min(id1, nams1_len);
+        id2 = my_min(id2, nams2_len);
         //Nam n1 = joint_nam_scores[i].nam1;
         //Nam n2 = joint_nam_scores[i].nam2;
         //int id1 = n1.ref_start == -1 ? nams1_len : n1.nam_id;
@@ -1972,6 +2266,26 @@ __device__ void sort_nams_single(
 ) {
     //bubble_sort(&(hits_per_ref[0]), hits_per_ref.size());
     quick_sort(&(nams[0]), nams.size());
+}
+
+__device__ void sort_nams_single2(
+        my_vector<Nam>& nams
+) {
+    //quick_sort(&(nams[0]), nams.size());
+    quick_sort_iterative(&(nams[0]), 0, nams.size() - 1, [](const Nam &n1, const Nam &n2) {
+         if(n1.is_rc != n2.is_rc) return n1.is_rc < n2.is_rc;
+         if(n1.ref_id != n2.ref_id) return n1.ref_id < n2.ref_id;
+         //if(n1.score != n2.score) return n1.score > n2.score;
+         if(n1.n_hits != n2.n_hits) return n1.n_hits > n2.n_hits;
+         if(n1.query_end != n2.query_end) return n1.query_end < n2.query_end;
+         if(n1.query_start != n2.query_start) return n1.query_start < n2.query_start;
+         if(n1.ref_end != n2.ref_end) return n1.ref_end < n2.ref_end;
+         if(n1.ref_start != n2.ref_start) return n1.ref_start < n2.ref_start;
+         //return n1.is_rc < n2.is_rc;
+         return true;
+    });
+
+    
 }
 
 __device__ int find_ref_ids(int ref_id, int* head, ref_ids_edge* edges) {
@@ -3143,9 +3457,11 @@ __global__ void gpu_sort_nams(
     int l_range = global_id * GPU_thread_task_size;
     int r_range = l_range + GPU_thread_task_size;
     if (r_range > num_tasks) r_range = num_tasks;
+    int read_num = num_tasks / 2;
     for (int id = l_range; id < r_range; id++) {
         //int max_tries = mapping_parameters->max_tries;
-        sort_nams_single(global_nams[id]);
+        if (id >= read_num) sort_nams_single(global_nams[id]);
+        else sort_nams_single2(global_nams[id]);
 		//topk_quick_sort(global_nams[id], max_tries * 2);
         //sort_nams_by_score(global_nams[id], max_tries * 2);
         //sort_nams_by_score(global_nams[id], 1e9);
@@ -4404,10 +4720,7 @@ int main(int argc, char **argv) {
         gpu_cost10 += GetTime() - t1;
         printf("align done\n");
 
-
-        
-		//print_global_align_res(global_align_res, s_len);
-
+        if (s_len < 10000) print_global_align_res(global_align_res, s_len);
 
         threads_per_block = 32;
         reads_per_block = threads_per_block * GPU_thread_task_size;
